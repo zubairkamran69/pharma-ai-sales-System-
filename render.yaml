@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: pharmaai-sales-api
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    disk:
+      name: pharmaai-uploads
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: UPLOAD_DIR
+        value: /var/data
+      - key: LLM_PROVIDER
+        value: demo
+      - key: DEMO_VERIFICATION
+        value: "false"

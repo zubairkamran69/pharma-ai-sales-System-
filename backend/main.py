@@ -24,7 +24,7 @@ import medical_router
 
 BASE=os.path.dirname(__file__)
 DATABASE_URL = os.getenv('DATABASE_URL') or None
-UP=os.path.join(BASE,'uploads')
+UP=os.getenv('UPLOAD_DIR') or os.path.join(BASE,'uploads')
 os.makedirs(UP,exist_ok=True)
 SECRET=os.getenv('JWT_SECRET') or os.getenv('PHARMAAI_SECRET')
 DB_INTEGRITY_ERRORS = (psycopg2.IntegrityError,) if psycopg2 is not None else ()
