@@ -319,7 +319,14 @@ def init():
       sales_rep_id INTEGER,
       medicine_id INTEGER,
       company_user_id INTEGER,
-      created_at TEXT
+      company_id INTEGER,
+      sales_representative_id INTEGER,
+      status TEXT DEFAULT 'open',
+      created_at TEXT,
+      updated_at TEXT,
+      last_message_at TEXT,
+      assigned_at TEXT,
+      closed_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS messages(
@@ -487,8 +494,16 @@ def init():
        "ALTER TABLE conversations ADD COLUMN company_id INTEGER"),
       ('conversations','sales_representative_id',
        "ALTER TABLE conversations ADD COLUMN sales_representative_id INTEGER"),
+      ('conversations','status',
+       "ALTER TABLE conversations ADD COLUMN status TEXT DEFAULT 'open'"),
+      ('conversations','updated_at',
+       "ALTER TABLE conversations ADD COLUMN updated_at TEXT"),
       ('conversations','last_message_at',
        "ALTER TABLE conversations ADD COLUMN last_message_at TEXT"),
+      ('conversations','assigned_at',
+       "ALTER TABLE conversations ADD COLUMN assigned_at TEXT"),
+      ('conversations','closed_at',
+       "ALTER TABLE conversations ADD COLUMN closed_at TEXT"),
       ('messages','sender_id',
        "ALTER TABLE messages ADD COLUMN sender_id INTEGER"),
       ('messages','sender_role',
@@ -570,6 +585,8 @@ def init():
 
 def token(u):
     payload = {'id':u['id'],'role':u['role'],'jti':str(uuid.uuid4()),'exp':datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)}
+    if u.get('company_user_id') is not None:
+        payload['company_user_id'] = u['company_user_id']
     return jwt.encode(payload,SECRET,algorithm='HS256')
 def auth(authorization: str|None=Header(default=None)):
     """
@@ -591,6 +608,10 @@ def auth(authorization: str|None=Header(default=None)):
     c=db(); u=c.execute('select * from users where id=?',(p['id'],)).fetchone(); c.close()
     if not u: raise HTTPException(401,'User not found')
     u=row(u)
+    if p.get('role') is not None:
+        u['role'] = p['role']
+    if p.get('company_user_id') is not None:
+        u['company_user_id'] = p['company_user_id']
     if u.get('verification_status') not in ('approved','demo') and u['role']!='admin': raise HTTPException(403,'Account is awaiting verification')
     u.pop('password',None)
     return u
@@ -601,10 +622,23 @@ def guard(role=None):
         return u
     return dep
 
-def owner_company_id(u): return u['id'] if u['role']=='pharma' else u.get('company_user_id')
+def owner_company_id(u):
+    if u.get('company_user_id') is not None:
+        return u['company_user_id']
+    if u.get('role') == 'pharma':
+        return u['id']
+    return None
+
+def resolve_conversation_company(conv):
+    conv_data = dict(conv) if hasattr(conv, 'keys') else conv or {}
+    return conv_data.get('company_id') or conv_data.get('company_user_id')
+
+def resolve_representative_id(conv):
+    conv_data = dict(conv) if hasattr(conv, 'keys') else conv or {}
+    return conv_data.get('sales_representative_id') or conv_data.get('sales_rep_id')
 
 def human_conversation_allowed(u, conv):
-    conv_data = dict(conv) if hasattr(conv, 'keys') else conv
+    conv_data = dict(conv) if hasattr(conv, 'keys') else conv or {}
     if not conv_data or conv_data.get('conversation_type') != 'human':
         return False
     if u['role'] == 'admin':
@@ -612,11 +646,16 @@ def human_conversation_allowed(u, conv):
     if u['role'] == 'doctor':
         return conv_data.get('doctor_id') == u['id']
     target_company = owner_company_id(u)
-    company_values = {v for v in (conv_data.get('company_id'), conv_data.get('company_user_id')) if v is not None}
+    company_values = {v for v in (resolve_conversation_company(conv_data), conv_data.get('company_user_id')) if v is not None}
     if u['role'] == 'pharma':
         return target_company is not None and target_company in company_values
     if u['role'] == 'sales_rep':
-        return target_company is not None and target_company in company_values
+        if target_company is None:
+            return False
+        if target_company in company_values:
+            rep_id = resolve_representative_id(conv_data)
+            return rep_id is None or rep_id == u['id']
+        return False
     return False
 
 def derive_company_code(company_name: str) -> str:
@@ -2790,17 +2829,303 @@ def chat(x:ChatIn,authorization: str|None=Header(default=None)):
     c=db(); c.execute('insert into messages(conversation_id,sender,agent,content,risk,created_at) values(?,?,?,?,?,?)',(cid,'agent',ans['agent'],ans['message'],ans['risk'],now())); c.commit(); c.close(); ans['conversation_id']=cid; return ans
 
 # ---- Human doctor <-> sales representative chat ----
+
+def _select_company_rep_for_chat(c, company_user_id: int | None, preferred_medicine_id: int | None = None):
+    if not company_user_id:
+        return None
+    rows = c.execute(
+        """
+        SELECT u.*,
+               (SELECT COUNT(*) FROM conversations conv
+                WHERE conv.conversation_type='human'
+                  AND COALESCE(conv.sales_representative_id, conv.sales_rep_id)=u.id
+                  AND COALESCE(conv.status, 'open') IN ('open','active','new')) AS assigned_count
+        FROM users u
+        WHERE u.role='sales_rep'
+          AND u.company_user_id=?
+          AND u.verification_status IN ('approved','demo')
+        ORDER BY assigned_count ASC, u.id ASC
+        LIMIT 1
+        """,
+        (company_user_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    return row(rows[0])
+
+
+@app.get('/api/doctor/pharma-companies')
+def doctor_pharma_companies(authorization: str | None = Header(default=None)):
+    u = guard('doctor')(authorization)
+    c = db()
+    q = """
+        SELECT u.id AS company_id,
+               u.name AS company_name,
+               u.company AS company,
+               u.verification_status,
+               COALESCE(u.address, '') AS location,
+               u.phone AS support_phone,
+               (SELECT COUNT(*) FROM medicines m WHERE m.owner_user_id=u.id) AS products_count,
+               (SELECT COUNT(*) FROM users rep WHERE rep.role='sales_rep' AND rep.company_user_id=u.id AND rep.verification_status IN ('approved','demo')) AS reps_count,
+               (SELECT COUNT(*) FROM users rep WHERE rep.role='sales_rep' AND rep.company_user_id=u.id AND rep.verification_status IN ('approved','demo')) > 0 AS available_contact
+        FROM users u
+        WHERE u.role='pharma'
+          AND u.verification_status IN ('approved','demo')
+        ORDER BY u.name ASC
+    """
+    companies = rows(c.execute(q))
+    c.close()
+    return companies
+
+
+@app.get('/api/pharma-companies/{company_id}')
+def pharma_company_detail(company_id: int, authorization: str | None = Header(default=None)):
+    u = auth(authorization)
+    c = db()
+    company = c.execute("SELECT * FROM users WHERE role='pharma' AND (id=? OR company_user_id=?)", (company_id, company_id)).fetchone()
+    if not company:
+        c.close(); raise HTTPException(404, 'Company not found')
+    company_row = row(company)
+    company_scope_id = company_row.get('company_user_id') or company_row['id']
+    if u['role'] not in ('doctor', 'pharma', 'sales_rep', 'admin'):
+        c.close(); raise HTTPException(403, 'Access denied')
+    if u['role'] == 'doctor':
+        allowed = True
+    elif u['role'] == 'admin':
+        allowed = False
+    elif u['role'] == 'pharma':
+        allowed = owner_company_id(u) == company_scope_id
+    else:
+        allowed = owner_company_id(u) == company_scope_id
+    if not allowed:
+        c.close(); raise HTTPException(403, 'Company access denied')
+    reps = rows(c.execute("SELECT id,name,email,phone,job_title,verification_status,company,created_at FROM users WHERE role='sales_rep' AND company_user_id=? ORDER BY id ASC", (company_scope_id,)))
+    products = rows(c.execute("SELECT * FROM medicines WHERE owner_user_id=? ORDER BY id DESC", (company_row['id'],)))
+    company_row['products'] = products
+    company_row['representatives'] = reps
+    company_row['products_count'] = len(products)
+    company_row['representatives_count'] = len(reps)
+    company_row['available_contact'] = bool(reps)
+    c.close(); return company_row
+
+
+@app.post('/api/conversations')
+def create_or_get_conversation(payload: dict | None = Body(default=None), authorization: str | None = Header(default=None)):
+    u = auth(authorization)
+    if u['role'] != 'doctor':
+        raise HTTPException(403, 'Only doctors can start a company conversation')
+    data = dict(payload or {})
+    company_id = data.get('company_id')
+    medicine_id = data.get('medicine_id')
+    if not company_id:
+        raise HTTPException(400, 'company_id is required')
+    c = db()
+    company = c.execute("SELECT * FROM users WHERE role='pharma' AND (id=? OR company_user_id=?) AND verification_status IN ('approved','demo')", (company_id, company_id)).fetchone()
+    if not company:
+        c.close(); raise HTTPException(404, 'Company not found or unavailable for chat')
+    company_row = row(company)
+    company_scope_id = company_row.get('company_user_id') or company_row['id']
+    rep = _select_company_rep_for_chat(c, company_scope_id, medicine_id)
+    if not rep:
+        c.close(); raise HTTPException(404, 'This company is currently unavailable for live chat. Please try again later.')
+    existing = c.execute(
+        """
+        SELECT id FROM conversations
+        WHERE conversation_type='human'
+          AND doctor_id=?
+          AND COALESCE(company_id, company_user_id)=?
+          AND COALESCE(medicine_id, -1)=COALESCE(?, medicine_id, -1)
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (u['id'], company_scope_id, medicine_id),
+    ).fetchone()
+    if existing:
+        cid = existing['id']
+    else:
+        conv_ts = now()
+        cid = c.execute(
+            """
+            INSERT INTO conversations(
+              user_id, role, conversation_type, doctor_id, company_id, company_user_id,
+              sales_rep_id, sales_representative_id, medicine_id, status, created_at,
+              updated_at, last_message_at, assigned_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (u['id'], 'doctor', 'human', u['id'], company_scope_id, company_scope_id, rep['id'], rep['id'], medicine_id, 'open', conv_ts, conv_ts, conv_ts, conv_ts),
+        ).lastrowid
+    c.execute('UPDATE conversations SET company_id=COALESCE(company_id, company_user_id), sales_representative_id=COALESCE(sales_representative_id, sales_rep_id), status=COALESCE(status, "open"), updated_at=?, last_message_at=COALESCE(last_message_at, ?) WHERE id=?', (now(), now(), cid))
+    c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)', (rep['id'], 'New Doctor Conversation', f'{u["name"]} has started a conversation regarding your company.', 'human_chat', now()))
+    c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)', (company_scope_id, 'Doctor Conversation Started', f'{u["name"]} opened a live conversation with your company.', 'human_chat', now()))
+    c.commit();
+    conv_row = c.execute('SELECT * FROM conversations WHERE id=?', (cid,)).fetchone()
+    c.close(); return row(conv_row)
+
+
+@app.get('/api/conversations')
+def list_conversations(authorization: str | None = Header(default=None)):
+    u = auth(authorization)
+    c = db()
+    if u['role'] == 'admin':
+        c.close(); raise HTTPException(403, 'Private hospital-to-company sales chats are restricted to authorized participants')
+    if u['role'] == 'doctor':
+        q = """
+            SELECT c.*, m.name AS medicine, cu.company AS company_name, sr.name AS representative_name,
+                   COALESCE(sr.name, 'Sales Representative') AS rep_name,
+                   du.name AS doctor_name
+            FROM conversations c
+            LEFT JOIN medicines m ON m.id = c.medicine_id
+            LEFT JOIN users cu ON cu.id = COALESCE(c.company_id, c.company_user_id)
+            LEFT JOIN users sr ON sr.id = COALESCE(c.sales_representative_id, c.sales_rep_id)
+            LEFT JOIN users du ON du.id = c.doctor_id
+            WHERE c.conversation_type='human' AND c.doctor_id=?
+            ORDER BY c.id DESC
+        """
+        params = (u['id'],)
+    elif u['role'] == 'pharma':
+        company_id = owner_company_id(u)
+        q = """
+            SELECT c.*, m.name AS medicine, du.name AS doctor_name, sr.name AS representative_name
+            FROM conversations c
+            LEFT JOIN medicines m ON m.id = c.medicine_id
+            LEFT JOIN users du ON du.id = c.doctor_id
+            LEFT JOIN users sr ON sr.id = COALESCE(c.sales_representative_id, c.sales_rep_id)
+            WHERE c.conversation_type='human' AND COALESCE(c.company_id, c.company_user_id)=?
+            ORDER BY c.id DESC
+        """
+        params = (company_id,)
+    elif u['role'] == 'sales_rep':
+        company_id = owner_company_id(u)
+        q = """
+            SELECT c.*, m.name AS medicine, du.name AS doctor_name, sr.name AS representative_name
+            FROM conversations c
+            LEFT JOIN medicines m ON m.id = c.medicine_id
+            LEFT JOIN users du ON du.id = c.doctor_id
+            LEFT JOIN users sr ON sr.id = COALESCE(c.sales_representative_id, c.sales_rep_id)
+            WHERE c.conversation_type='human'
+              AND (COALESCE(c.company_id, c.company_user_id)=? OR COALESCE(c.sales_representative_id, c.sales_rep_id)=?)
+            ORDER BY c.id DESC
+        """
+        params = (company_id, u['id'])
+    else:
+        c.close(); raise HTTPException(403, 'Permission denied')
+    conversations = rows(c.execute(q, params))
+    c.close(); return conversations
+
+
+@app.get('/api/conversations/{conversation_id}')
+def get_conversation(conversation_id: int, authorization: str | None = Header(default=None)):
+    u = auth(authorization)
+    c = db()
+    conv = c.execute('SELECT * FROM conversations WHERE id=? AND conversation_type="human"', (conversation_id,)).fetchone()
+    if not conv:
+        c.close(); raise HTTPException(404, 'Conversation not found')
+    if not human_conversation_allowed(u, conv):
+        c.close(); raise HTTPException(403, 'Conversation access denied')
+    detail = row(conv)
+    detail['messages'] = rows(c.execute('SELECT * FROM messages WHERE conversation_id=? ORDER BY id ASC', (conversation_id,)))
+    c.close(); return detail
+
+
+@app.get('/api/conversations/{conversation_id}/messages')
+def conversation_messages(conversation_id: int, authorization: str | None = Header(default=None)):
+    u = auth(authorization)
+    c = db()
+    conv = c.execute('SELECT * FROM conversations WHERE id=? AND conversation_type="human"', (conversation_id,)).fetchone()
+    if not conv:
+        c.close(); raise HTTPException(404, 'Conversation not found')
+    if not human_conversation_allowed(u, conv):
+        c.close(); raise HTTPException(403, 'Conversation access denied')
+    rows_out = rows(c.execute('SELECT * FROM messages WHERE conversation_id=? ORDER BY id ASC', (conversation_id,)))
+    c.close(); return rows_out
+
+
+@app.post('/api/conversations/{conversation_id}/messages')
+def send_conversation_message(conversation_id: int, payload: dict | None = Body(default=None), authorization: str | None = Header(default=None)):
+    u = auth(authorization)
+    content = (payload or {}).get('content') if payload else None
+    if not content or not str(content).strip():
+        raise HTTPException(400, 'Message content is required')
+    c = db()
+    conv = c.execute('SELECT * FROM conversations WHERE id=? AND conversation_type="human"', (conversation_id,)).fetchone()
+    if not conv:
+        c.close(); raise HTTPException(404, 'Conversation not found')
+    if not human_conversation_allowed(u, conv):
+        c.close(); raise HTTPException(403, 'Conversation access denied')
+    sent_at = now()
+    c.execute(
+        'INSERT INTO messages(conversation_id,sender,sender_id,sender_role,message,content,agent,risk,created_at,read_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        (conversation_id, u['role'], u['id'], u['role'], str(content).strip(), str(content).strip(), u['name'], 'human', sent_at, None),
+    )
+    c.execute('UPDATE conversations SET updated_at=?, last_message_at=?, status=COALESCE(status, "open") WHERE id=?', (sent_at, sent_at, conversation_id))
+    c.commit(); c.close(); return {'ok': True, 'conversation_id': conversation_id, 'created_at': sent_at}
+
+
+@app.patch('/api/conversations/{conversation_id}')
+def update_conversation(conversation_id: int, payload: dict | None = Body(default=None), authorization: str | None = Header(default=None)):
+    u = auth(authorization)
+    data = dict(payload or {})
+    c = db()
+    conv = c.execute('SELECT * FROM conversations WHERE id=? AND conversation_type="human"', (conversation_id,)).fetchone()
+    if not conv:
+        c.close(); raise HTTPException(404, 'Conversation not found')
+    conv_row = row(conv)
+    if not human_conversation_allowed(u, conv_row):
+        c.close(); raise HTTPException(403, 'Conversation access denied')
+    if 'status' in data:
+        new_status = str(data['status']).strip() or 'open'
+        c.execute('UPDATE conversations SET status=?, updated_at=?, closed_at=? WHERE id=?', (new_status, now(), (None if new_status not in ('closed','resolved','rejected') else now()), conversation_id))
+    if 'sales_representative_id' in data:
+        rep_id = data['sales_representative_id']
+        c.execute('UPDATE conversations SET sales_representative_id=?, sales_rep_id=?, assigned_at=?, updated_at=? WHERE id=?', (rep_id, rep_id, now(), now(), conversation_id))
+    c.commit(); updated = c.execute('SELECT * FROM conversations WHERE id=?', (conversation_id,)).fetchone(); c.close(); return row(updated)
+
+
+@app.post('/api/conversations/{conversation_id}/assign')
+def assign_conversation_rep(conversation_id: int, payload: dict | None = Body(default=None), authorization: str | None = Header(default=None)):
+    u = auth(authorization)
+    if u['role'] not in ('pharma', 'sales_rep'):
+        raise HTTPException(403, 'Only the company workspace can reassign a representative')
+    data = dict(payload or {})
+    rep_id = data.get('sales_representative_id') or data.get('rep_id')
+    if not rep_id:
+        raise HTTPException(400, 'sales_representative_id is required')
+    c = db(); conv = c.execute('SELECT * FROM conversations WHERE id=? AND conversation_type="human"', (conversation_id,)).fetchone();
+    if not conv:
+        c.close(); raise HTTPException(404, 'Conversation not found')
+    conv_row = row(conv)
+    if owner_company_id(u) != (conv_row.get('company_id') or conv_row.get('company_user_id')):
+        c.close(); raise HTTPException(403, 'Access denied')
+    c.execute('UPDATE conversations SET sales_representative_id=?, sales_rep_id=?, assigned_at=?, updated_at=? WHERE id=?', (rep_id, rep_id, now(), now(), conversation_id))
+    c.commit(); updated = c.execute('SELECT * FROM conversations WHERE id=?', (conversation_id,)).fetchone(); c.close(); return row(updated)
+
+
+@app.post('/api/conversations/{conversation_id}/read')
+def mark_conversation_read(conversation_id: int, authorization: str | None = Header(default=None)):
+    u = auth(authorization)
+    c = db(); conv = c.execute('SELECT * FROM conversations WHERE id=? AND conversation_type="human"', (conversation_id,)).fetchone()
+    if not conv:
+        c.close(); raise HTTPException(404, 'Conversation not found')
+    conv_row = row(conv)
+    if not human_conversation_allowed(u, conv_row):
+        c.close(); raise HTTPException(403, 'Conversation access denied')
+    c.execute('UPDATE conversations SET updated_at=?, last_message_at=COALESCE(last_message_at, ?) WHERE id=?', (now(), now(), conversation_id))
+    c.execute('UPDATE messages SET read_at=? WHERE conversation_id=? AND sender_id!=?', (now(), conversation_id, u['id']))
+    c.commit(); c.close(); return {'ok': True}
+
+
 @app.post('/api/contact-rep/{medicine_id}')
 def contact_rep(medicine_id:int,authorization: str|None=Header(default=None)):
     u=guard('doctor')(authorization); c=db(); m=c.execute('select * from medicines where id=?',(medicine_id,)).fetchone()
     if not m or not m['owner_user_id']: raise HTTPException(404,'Medicine/company not found')
-    rep=c.execute("select * from users where role='sales_rep' and company_user_id=? and verification_status='approved' order by id limit 1",(m['owner_user_id'],)).fetchone()
+    rep=_select_company_rep_for_chat(c, m['owner_user_id'])
     if not rep: c.close(); raise HTTPException(404,'No verified sales representative is available for this company')
-    existing=c.execute("select id from conversations where conversation_type='human' and doctor_id=? and (COALESCE(company_id, company_user_id)=? or COALESCE(company_user_id, company_id)=?) and medicine_id=? order by id desc limit 1",(u['id'],m['owner_user_id'],m['owner_user_id'],medicine_id)).fetchone()
+    existing=c.execute("select id from conversations where conversation_type='human' and doctor_id=? and company_id=? and medicine_id=? order by id desc limit 1",(u['id'],m['owner_user_id'],medicine_id)).fetchone()
     if existing: cid=existing['id']
-    else: cid=c.execute('insert into conversations(user_id,role,conversation_type,doctor_id,sales_rep_id,medicine_id,company_user_id,company_id,sales_representative_id,created_at) values(?,?,?,?,?,?,?,?,?,?)',(u['id'],'doctor','human',u['id'],rep['id'],medicine_id,m['owner_user_id'],m['owner_user_id'],rep['id'],now())).lastrowid
+    else: cid=c.execute('insert into conversations(user_id,role,conversation_type,doctor_id,sales_rep_id,medicine_id,company_user_id,company_id,sales_representative_id,status,created_at,updated_at,last_message_at,assigned_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(u['id'],'doctor','human',u['id'],rep['id'],medicine_id,m['owner_user_id'],m['owner_user_id'],rep['id'],'open',now(),now(),now(),now())).lastrowid
     c.execute('update conversations set company_id=COALESCE(company_id, company_user_id), sales_representative_id=COALESCE(sales_representative_id, sales_rep_id) where id=?',(cid,))
     c.execute('insert into notifications(user_id,title,body,type,created_at) values(?,?,?,?,?)',(rep['id'],'Doctor requested human chat',f'{u["name"]} wants to speak about {m["name"]}.','human_chat',now())); c.commit(); out={'conversation_id':cid,'medicine':m['name'],'company':m['company'],'representative':{k:rep[k] for k in ['id','name','email','phone','job_title']}}; c.close(); return out
+
 @app.get('/api/human-conversations')
 def human_conversations(authorization: str|None=Header(default=None)):
     u=auth(authorization); c=db()
