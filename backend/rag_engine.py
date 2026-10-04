@@ -1,16 +1,45 @@
 import os
 import re
 import json
+import logging
 import urllib.request
 import urllib.error
 import io
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=False)
+
+llm_logger = logging.getLogger('pharmaai.llm')
+
+# Hosted inference endpoints sit behind a CDN that rejects the default
+# `Python-urllib/x.y` agent with HTTP 403 (Cloudflare error 1010), which the
+# previous code turned into an opaque "AI provider is unavailable" failure.
+# Every outbound request therefore identifies itself explicitly.
+HOSTED_USER_AGENT = os.getenv('LLM_USER_AGENT', 'PharmaAI-Sales-Agent/3.0 (+FastAPI)').strip()
+
+# Reasoning models (for example openai/gpt-oss-*) spend part of their token
+# budget on internal reasoning before emitting content, so the budget has to be
+# large enough that a normal answer still fits after the reasoning tokens.
+DEFAULT_MAX_COMPLETION_TOKENS = int(os.getenv('LLM_MAX_COMPLETION_TOKENS', '2048'))
+
+
+def safe_llm_error(exc: BaseException, limit: int = 300) -> str:
+    """Exception text with credentials and bearer tokens removed."""
+    text = f'{type(exc).__name__}: {exc}'
+    for secret in (
+        os.getenv('GROQ_API_KEY'),
+        os.getenv('LLM_API_KEY'),
+        os.getenv('OPENAI_API_KEY'),
+    ):
+        if secret and secret.strip():
+            text = text.replace(secret.strip(), '***redacted***')
+    text = re.sub(r'(bearer\s+)[A-Za-z0-9._\-]{16,}', r'\1***redacted***', text, flags=re.IGNORECASE)
+    text = re.sub(r'(eyJ[A-Za-z0-9_\-]{6,}\.)+[A-Za-z0-9_\-]{10,}', '***redacted-token***', text)
+    return ' '.join(text.split())[:limit]
 
 
 try:
@@ -521,15 +550,65 @@ class LLMClient:
                 'For product facts, state that information is unavailable instead of guessing.'
             )
 
-        payload = {'model': self.model, 'messages': [
-            {'role': 'system', 'content': system},
-            {'role': 'user', 'content': user_message}
-        ]}
+        message = self.complete(
+            system=system,
+            messages=[{'role': 'user', 'content': user_message}],
+            temperature=0.2,
+        )
+        return {'text': message['content'], 'provider': f'{self.provider}:{self.model}'}
+
+    def complete(
+        self,
+        system: str,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.2,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        operation: str = 'chat',
+    ) -> Dict[str, Any]:
+        """
+        Single low-level chat-completion call.
+
+        Returns {'content', 'reasoning', 'tool_calls', 'finish_reason'} so the
+        caller can implement tool calling without knowing provider details. The
+        previous implementation re-wrapped every provider failure into one
+        identical message, which is why real causes never reached the logs.
+        """
+        if self.provider == 'demo':
+            return {
+                'content': self._fallback(messages[-1]['content'] if messages else '', [])['text'],
+                'reasoning': '',
+                'tool_calls': [],
+                'finish_reason': 'stop',
+            }
+        if self.provider not in ('groq', 'openai', 'openai-compatible', 'ollama'):
+            raise RuntimeError('Unsupported LLM_PROVIDER. Use groq, openai, openai-compatible, ollama, or demo.')
+        if self.provider != 'ollama' and not self.api_key:
+            raise RuntimeError(f'The {self.provider} provider requires an API key.')
+
+        conversation: List[Dict[str, Any]] = []
+        if system:
+            conversation.append({'role': 'system', 'content': system})
+        conversation.extend(messages)
+
+        payload: Dict[str, Any] = {
+            'model': self.model,
+            'messages': conversation,
+            'temperature': temperature,
+        }
         if self.provider == 'ollama':
             payload['stream'] = False
-        request_headers = {'Content-Type': 'application/json'}
+        else:
+            payload['max_completion_tokens'] = DEFAULT_MAX_COMPLETION_TOKENS
+        if tools:
+            payload['tools'] = tools
+            payload['tool_choice'] = tool_choice or 'auto'
+
+        request_headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
         if self.provider != 'ollama':
             request_headers['Authorization'] = f'Bearer {self.api_key}'
+            request_headers['User-Agent'] = HOSTED_USER_AGENT
+
         request = urllib.request.Request(
             self.base_url,
             data=json.dumps(payload).encode('utf-8'),
@@ -537,17 +616,70 @@ class LLMClient:
             method='POST'
         )
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
+            with urllib.request.urlopen(request, timeout=90) as response:
                 result = json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            body = ''
+            try:
+                body = exc.read().decode('utf-8', errors='ignore')[:300]
+            except Exception:
+                pass
+            llm_logger.warning(
+                'LLM %s failed: provider=%s model=%s status=%s detail=%s',
+                operation, self.provider, self.model, exc.code, safe_llm_error(RuntimeError(body or exc.reason))
+            )
+            raise RuntimeError(
+                f'The {self.provider} provider rejected the request (HTTP {exc.code}). Check the model name, key and token limit.'
+            ) from exc
         except Exception as exc:
-            raise RuntimeError('The configured LLM provider request failed.') from exc
-        try:
-            text = result.get('message', {}).get('content') if self.provider == 'ollama' else result['choices'][0]['message']['content']
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError('The configured LLM provider returned an invalid response.') from exc
-        if not text:
-            raise RuntimeError('The configured LLM provider returned an empty response.')
-        return {'text': text, 'provider': f'{self.provider}:{self.model}'}
+            llm_logger.warning(
+                'LLM %s failed: provider=%s model=%s detail=%s',
+                operation, self.provider, self.model, safe_llm_error(exc)
+            )
+            raise RuntimeError(f'The {self.provider} provider request failed.') from exc
+
+        if self.provider == 'ollama':
+            raw_message = result.get('message') or {}
+        else:
+            try:
+                raw_message = result['choices'][0]['message']
+            except (KeyError, IndexError, TypeError) as exc:
+                llm_logger.warning(
+                    'LLM %s returned an unexpected payload: provider=%s model=%s keys=%s',
+                    operation, self.provider, self.model, sorted(result)[:8] if isinstance(result, dict) else type(result).__name__
+                )
+                raise RuntimeError(f'The {self.provider} provider returned an unexpected response shape.') from exc
+
+        content = (raw_message.get('content') or '').strip()
+        reasoning = (raw_message.get('reasoning') or '').strip()
+        tool_calls = []
+        for call in raw_message.get('tool_calls') or []:
+            function = call.get('function') or {}
+            if not function.get('name'):
+                continue
+            try:
+                arguments = json.loads(function.get('arguments') or '{}')
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+            tool_calls.append({'id': call.get('id'), 'name': function['name'], 'arguments': arguments})
+
+        if not content and not tool_calls:
+            finish_reason = (result.get('choices') or [{}])[0].get('finish_reason') if self.provider != 'ollama' else None
+            llm_logger.warning(
+                'LLM %s produced no usable content: provider=%s model=%s finish_reason=%s reasoning_chars=%d',
+                operation, self.provider, self.model, finish_reason, len(reasoning)
+            )
+            raise RuntimeError(
+                f'The {self.provider} provider returned an empty answer (finish_reason={finish_reason}). '
+                'Increase LLM_MAX_COMPLETION_TOKENS or change the model.'
+            )
+
+        return {
+            'content': content,
+            'reasoning': reasoning,
+            'tool_calls': tool_calls,
+            'finish_reason': (result.get('choices') or [{}])[0].get('finish_reason') if self.provider != 'ollama' else None,
+        }
 
     def _context(
         self,

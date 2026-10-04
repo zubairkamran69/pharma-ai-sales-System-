@@ -128,7 +128,15 @@ def test_system_help_role_response_for_doctor_without_medicine_management_permis
         cleanup_temp_db(db_path)
 
 
-def test_broad_medicine_question_uses_general_answer_when_pharmaai_data_is_incomplete():
+def test_broad_medicine_question_answers_from_the_database_catalogue():
+    """
+    "Tell me about all the medicines we have in the system" is a request for
+    stored records, so the assistant has to read them from the database.
+
+    It used to be classified as a medicine-knowledge question and answered with
+    the generic "General AI Information - Not PharmaAI Verified" paragraph, which
+    hid rows that were sitting in the catalogue.
+    """
     db_path = setup_temp_db()
     try:
         with TestClient(main.app) as client:
@@ -142,13 +150,12 @@ def test_broad_medicine_question_uses_general_answer_when_pharmaai_data_is_incom
             )
 
             assert response.status_code == 200, response.text
-            text = response.json()['message']
-            lower = text.lower()
-            assert 'general ai information' in lower or 'not pharmaai verified' in lower
-            assert 'pharmaai knowledge base' in lower or 'pharmaai-verified' in lower or 'pharmaai verified' in lower
-            assert 'specify a medicine name' in lower or 'tell me the medicine name' in lower
-            assert 'i do not have this information' not in lower
-            assert 'approved knowledge base does not contain' not in lower
+            payload = response.json()
+            lower = payload['message'].lower()
+            assert 'test cardio' in lower, payload['message']
+            assert 'not pharmaai verified' not in lower
+            if payload.get('route') == 'database-tools':
+                assert [tool['tool'] for tool in payload['tools']] == ['list_products']
     finally:
         cleanup_temp_db(db_path)
 

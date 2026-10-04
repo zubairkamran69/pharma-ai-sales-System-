@@ -69,6 +69,19 @@ def create_pharma_user(db_path):
     return user_id
 
 
+def test_missing_jwt_secret_uses_local_dev_fallback(monkeypatch):
+    monkeypatch.delenv('JWT_SECRET', raising=False)
+    monkeypatch.delenv('PHARMAAI_SECRET', raising=False)
+    reloaded = __import__('importlib').reload(main)
+    try:
+        assert reloaded.SECRET
+        assert len(reloaded.SECRET) >= 32
+        assert reloaded.SECRET == reloaded.DEFAULT_LOCAL_JWT_SECRET
+    finally:
+        monkeypatch.setenv('JWT_SECRET', 'isolated-test-secret-value-at-least-32-chars')
+        __import__('importlib').reload(main)
+
+
 def test_medicine_creation_rejects_negative_price_and_requires_company_fields():
     db_path = setup_temp_db()
     try:
