@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import os
 import sqlite3
 import tempfile
@@ -122,3 +123,106 @@ def test_sales_rep_creation_generates_unique_sales_id_and_auto_company():
 def test_business_count_question_is_not_treated_as_medical_rag():
     result = medical_router.classify('How many medicines do we have in the system?', [])
     assert result['medical'] is False
+
+
+def test_message_migration_preserves_sender_id_and_is_repeatable():
+    db_path = setup_temp_db()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                'INSERT INTO messages(conversation_id,sender,agent,content,risk,created_at,sender_id) VALUES(?,?,?,?,?,?,?)',
+                (99, 'human', 'Sales Rep', 'Existing message', 'human', main.now(), 42),
+            )
+            conn.commit()
+
+        main.init()
+        main.init()
+
+        with sqlite3.connect(db_path) as conn:
+            sender_id, sender_role, message = conn.execute(
+                'SELECT sender_id,sender_role,message FROM messages WHERE conversation_id=?',
+                (99,),
+            ).fetchone()
+
+        assert sender_id == 42
+        assert sender_role == 'agent'
+        assert message == 'Existing message'
+    finally:
+        cleanup_temp_db(db_path)
+
+
+def test_uploaded_document_bytes_and_rag_chunks_are_database_backed():
+    db_path = setup_temp_db()
+    try:
+        pharma_id = create_pharma_user(db_path)
+        pharma_token = main.token({'id': pharma_id, 'role': 'pharma'})
+        with TestClient(main.app) as client:
+            medicine_response = client.post(
+                '/api/medicines',
+                headers={'Authorization': f'Bearer {pharma_token}'},
+                json={
+                    'name': 'Persistent Demo Product',
+                    'category': 'Demo',
+                    'price': 10,
+                    'description': 'Product for storage regression coverage',
+                    'manufacturer': 'NovaCure Pharmaceuticals',
+                    'specializations': ['Cardiology']
+                },
+            )
+            assert medicine_response.status_code == 200, medicine_response.text
+            medicine_id = medicine_response.json()['id']
+            document_text = b'Persistent database document. Synthetic product storage test content.'
+            response = client.post(
+                f'/api/documents/{medicine_id}',
+                headers={'Authorization': f'Bearer {pharma_token}'},
+                files={'file': ('profile.txt', document_text, 'text/plain')},
+            )
+            assert response.status_code == 200, response.text
+
+        with sqlite3.connect(db_path) as conn:
+            stored_bytes, stored_path = conn.execute(
+                'SELECT file_data,path FROM documents WHERE filename=?',
+                ('profile.txt',),
+            ).fetchone()
+            chunk_count = conn.execute(
+                'SELECT count(*) FROM knowledge_chunks WHERE document_id=(SELECT id FROM documents WHERE filename=?)',
+                ('profile.txt',),
+            ).fetchone()[0]
+
+        assert stored_bytes == document_text
+        assert stored_path is None
+        assert chunk_count > 0
+    finally:
+        cleanup_temp_db(db_path)
+
+
+def test_legacy_password_is_verified_and_upgraded_on_login():
+    db_path = setup_temp_db()
+    legacy_password = 'legacy-test-password'
+    legacy_hash = hashlib.sha256(('pharmaai:' + legacy_password).encode()).hexdigest()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                'INSERT INTO users(name,email,password,role,created_at,verification_status) VALUES(?,?,?,?,?,?)',
+                ('Legacy Doctor', 'legacy.doctor@test.local', legacy_hash, 'doctor', main.now(), 'approved'),
+            )
+            conn.commit()
+
+        with TestClient(main.app) as client:
+            response = client.post(
+                '/api/auth/login',
+                json={'email': 'legacy.doctor@test.local', 'password': legacy_password},
+            )
+            assert response.status_code == 200, response.text
+            assert 'password' not in response.json()['user']
+
+        with sqlite3.connect(db_path) as conn:
+            stored_hash = conn.execute(
+                'SELECT password FROM users WHERE email=?',
+                ('legacy.doctor@test.local',),
+            ).fetchone()[0]
+
+        assert stored_hash.startswith('pbkdf2_sha256$')
+        assert stored_hash != legacy_hash
+    finally:
+        cleanup_temp_db(db_path)

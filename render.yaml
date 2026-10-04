@@ -15,9 +15,21 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DEMO_USER_EMAIL
+        sync: false
+      - key: DEMO_USER_PASSWORD
+        sync: false
+      - key: CLIENT_URL
+        sync: false
       - key: UPLOAD_DIR
         value: /var/data
       - key: LLM_PROVIDER
-        value: demo
+        value: groq
+      - key: GROQ_API_KEY
+        sync: false
       - key: DEMO_VERIFICATION
         value: "false"

@@ -3,6 +3,7 @@ import re
 import json
 import urllib.request
 import urllib.error
+import io
 
 from typing import List, Dict, Any
 
@@ -77,6 +78,19 @@ class MedicineRAG:
             errors='ignore'
         ) as f:
             return f.read()
+
+    def extract_text_from_bytes(self, filename: str, content: bytes) -> str:
+        ext = os.path.splitext(filename)[1].lower()
+        source = io.BytesIO(content)
+        if ext == '.pdf':
+            if not PdfReader:
+                raise RuntimeError('PDF parser unavailable. Install pypdf.')
+            return '\n'.join((page.extract_text() or '') for page in PdfReader(source).pages)
+        if ext == '.docx':
+            if not Document:
+                raise RuntimeError('DOCX parser unavailable. Install python-docx.')
+            return '\n'.join(paragraph.text for paragraph in Document(source).paragraphs)
+        return content.decode('utf-8', errors='ignore')
 
     def clean(self, text: str) -> str:
         text = text.replace('\r', '\n')
@@ -154,11 +168,12 @@ class MedicineRAG:
         self,
         medicine_id: int,
         document_id: int,
-        path: str,
-        filename: str
+        path: str | None,
+        filename: str,
+        content: bytes | None = None
     ) -> Dict[str, Any]:
 
-        text = self.extract_text(path)
+        text = self.extract_text_from_bytes(filename, content) if content is not None else self.extract_text(path or '')
 
         chunks = self.chunk(text)
 

@@ -36,7 +36,38 @@ def setup_temp_db():
         return conn
     main.db = connect_test_db
     main.JWT_BLACKLIST.clear()
-    main.init()
+    bootstrap = {
+        key: os.environ.get(key)
+        for key in ('ADMIN_EMAIL', 'ADMIN_PASSWORD', 'DEMO_USER_EMAIL', 'DEMO_USER_PASSWORD')
+    }
+    os.environ.update({
+        'ADMIN_EMAIL': 'admin@pharmaai.local',
+        'ADMIN_PASSWORD': 'admin123',
+        'DEMO_USER_EMAIL': 'doctor@pharmaai.local',
+        'DEMO_USER_PASSWORD': 'doctor123',
+    })
+    try:
+        main.init()
+    finally:
+        for key, value in bootstrap.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    with sqlite3.connect(temp_db.name) as conn:
+        pharma_id = conn.execute(
+            'INSERT INTO users(name,email,password,role,company,created_at,verification_status,job_title) VALUES(?,?,?,?,?,?,?,?)',
+            ('Test Pharma', 'base.pharma@test.local', main.phash('test-only'), 'pharma', 'Test Pharma', main.now(), 'approved', 'Test'),
+        ).lastrowid
+        rep_id = conn.execute(
+            'INSERT INTO users(name,email,password,role,company,created_at,verification_status,job_title,company_user_id,sales_id,registration_number) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            ('Test Rep', 'base.rep@test.local', main.phash('test-only'), 'sales_rep', 'Test Pharma', main.now(), 'approved', 'Test', pharma_id, 'TST-100', 'TST-100'),
+        ).lastrowid
+        conn.execute(
+            'INSERT INTO medicines(name,category,price,description,specializations,stock,status,sales,created_at,owner_user_id,company) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            ('Test Cardio', 'Cardiology', 100, 'Synthetic fixture product', '["Cardiology"]', 25, 'Active', 0, main.now(), pharma_id, 'Test Pharma'),
+        )
+        conn.commit()
     return temp_db.name
 
 
@@ -334,7 +365,7 @@ def test_company_isolated_human_chats_reject_cross_company_access():
             blocked_rep = client.get(f'/api/human-conversations/{cid}', headers={'Authorization': f'Bearer {beta_rep_token}'})
             assert blocked_rep.status_code == 403, blocked_rep.text
 
-            owner = client.post('/api/auth/login', json={'email': 'owner@pharmaai.local', 'password': 'owner123'}).json()
+            owner = client.post('/api/auth/login', json={'email': 'admin@pharmaai.local', 'password': 'admin123'}).json()
             owner_token = owner['token']
             blocked_owner = client.get(f'/api/human-conversations/{cid}', headers={'Authorization': f'Bearer {owner_token}'})
             assert blocked_owner.status_code == 403, blocked_owner.text

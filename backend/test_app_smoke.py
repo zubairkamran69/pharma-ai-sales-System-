@@ -20,6 +20,11 @@ def client(tmp_path, monkeypatch):
         return conn
 
     monkeypatch.setattr(main, 'db', connect_test_db)
+    monkeypatch.setenv('ADMIN_EMAIL', 'admin@pharmaai.local')
+    monkeypatch.setenv('ADMIN_PASSWORD', 'admin123')
+    monkeypatch.setenv('DEMO_USER_EMAIL', 'doctor@pharmaai.local')
+    monkeypatch.setenv('DEMO_USER_PASSWORD', 'doctor123')
+    main.init()
     with TestClient(main.app) as test_client:
         yield test_client
 
