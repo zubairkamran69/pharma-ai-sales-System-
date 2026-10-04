@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+.venv*/
+venv/
+env/
+node_modules/
+dist/
+build/
+coverage/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tmp_verify.py
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Local app/runtime artifacts
+*.log
+server.log
+*.db-journal
+backend/uploads/
+backend/*.db
+backend/__pycache__/
+backend/.venv/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
