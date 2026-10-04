@@ -415,7 +415,17 @@ async function openHuman(cid) {
         clearInterval(humanRefreshTimer);
         humanRefreshTimer = setInterval(refreshHumanConversation, 5000);
     } catch (e) {
-        toast('Unable to load this conversation. Please try again.');
+        console.error('[company-chat] conversation detail request failed', {
+            url: e.url || `${API}/human-conversations/${cid}`,
+            method: e.method || 'GET',
+            status: e.status ?? null,
+            responseBody: e.responseBody || e.message,
+            conversationId: cid,
+            authenticatedUserId: me?.id ?? null,
+            authenticatedRole: role,
+            authenticated: Boolean(token)
+        });
+        toast(e.message || 'Unable to load this conversation. Please try again.');
     }
 }
 async function claimHumanConversation(conversationId) {
