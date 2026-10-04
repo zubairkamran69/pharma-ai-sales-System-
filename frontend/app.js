@@ -1,4 +1,5 @@
-const API = '/api';
+const API_URL = (window.PHARMAAI_API_URL || '').replace(/\/+$/, '');
+const API = `${API_URL}/api`;
 let token = localStorage.getItem('pharmaai_token');
 let me = JSON.parse(localStorage.getItem('pharmaai_user') || 'null');
 let role = me?.role || 'doctor', page = 'dashboard', authMode = 'login', currentConversationId = null, humanConversationId = null, notificationItems = [], hiddenRepIds = [], navigationRequest = 0;

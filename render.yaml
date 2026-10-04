@@ -24,7 +24,7 @@ services:
       - key: DEMO_USER_PASSWORD
         sync: false
       - key: CLIENT_URL
-        sync: false
+        value: https://pharma-ai-sales-system-frontend.vercel.app
       - key: UPLOAD_DIR
         value: /var/data
       - key: LLM_PROVIDER

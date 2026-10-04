@@ -3,10 +3,10 @@
 ## Architecture
 
 ```text
-Vercel static frontend -> Vercel /api rewrite -> Render FastAPI -> Neon PostgreSQL
+Vercel Vite frontend -> Render FastAPI -> Neon PostgreSQL
 ```
 
-The frontend is plain static HTML/JavaScript, not a Vite build. It calls relative `/api` URLs; `frontend/vercel.json` proxies those requests to the Render service. Do not configure `VITE_API_URL` unless the frontend is migrated to Vite.
+The UI remains the existing HTML/CSS/JavaScript, built by Vite so Vercel can inject `VITE_API_URL`. API requests go directly to Render; Vercel does not proxy or serve backend routes.
 
 ## Neon
 
@@ -32,7 +32,7 @@ Set these Render environment variables:
 | --- | --- | --- |
 | `DATABASE_URL` | Yes | Neon PostgreSQL URL; keep private. |
 | `JWT_SECRET` | Yes | Use a unique random value of at least 32 characters. The Blueprint can generate one. |
-| `CLIENT_URL` | Yes | Exact production Vercel origin, e.g. `https://your-project.vercel.app`; no trailing slash. |
+| `CLIENT_URL` | Yes | Exact production Vercel origin, currently `https://pharma-ai-sales-system-frontend.vercel.app`; no trailing slash. |
 | `ADMIN_EMAIL` | Optional | Initial platform admin email. Set together with `ADMIN_PASSWORD`. |
 | `ADMIN_PASSWORD` | Optional | Initial admin password; account is created only if its email is absent. |
 | `DEMO_USER_EMAIL` | Optional | Initial demo doctor email. Set together with `DEMO_USER_PASSWORD`. |
@@ -54,19 +54,19 @@ Restart/redeploy after changing environment values. Do not paste secrets into Gi
 
 ## Vercel
 
-1. Import this repository.
-2. Set the project root directory to `frontend` and use no build command (static site).
-3. Confirm `frontend/vercel.json` points `/api/*` to the actual Render service URL. Update its destination if the Render service hostname changes.
-4. Set `CLIENT_URL` in Render to the exact Vercel production origin. Add preview origins to `CORS_ORIGINS` only when needed.
+1. Import this repository and set the project root directory to `frontend`.
+2. Use `npm run build` as the build command and `dist` as the output directory.
+3. Set the Vercel environment variable `VITE_API_URL` to `https://pharmaai-sales-api.onrender.com` (the current Render service URL), for Production and any environments you deploy.
+4. Set `CLIENT_URL` in Render to the exact Vercel production origin shown above. Add preview origins to `CORS_ORIGINS` only when needed.
 
-No Vercel API secret or Neon variable is needed; the browser talks to Vercel's same-origin `/api` rewrite.
+No database or API secret belongs in Vercel. The browser calls `${VITE_API_URL}/api/...` directly.
 
 ## Safe deployment sequence
 
 1. Rotate any exposed database credentials; set `DATABASE_URL` and a new `JWT_SECRET` in Render.
 2. Set `CLIENT_URL`, and optionally the paired admin/demo credentials and Groq key.
 3. Deploy the Render Blueprint and verify `/api/health` returns `healthy`.
-4. Deploy the static frontend to Vercel and test login, company-scoped data, messages, orders, and document upload.
+4. Deploy the existing frontend through Vite to Vercel and test login, company-scoped data, messages, orders, and document upload. Confirm browser requests use the Render origin, not the Vercel origin.
 5. Confirm the uploaded file has a database row and a non-null `file_data` value before removing any legacy persistent disk.
 
 Never remove the existing Render disk until legacy file migration is verified. Schema changes are additive and preserve existing records; back up the Neon project before production rollout.
