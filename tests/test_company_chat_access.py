@@ -158,9 +158,16 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
             rep_a_token = main.token({'id': 6, 'role': 'sales_rep', 'company_user_id': 101})
             rep_b_token = main.token({'id': 7, 'role': 'sales_rep', 'company_user_id': 102})
 
+            with sqlite3.connect(db_path) as conn:
+                conn.execute('UPDATE conversations SET company_id=3, company_user_id=101 WHERE id=1')
+                conn.commit()
+
             directory = client.get('/api/doctor/pharma-companies', headers={'Authorization': f'Bearer {doctor_token}'})
             assert directory.status_code == 200, directory.text
             assert {company['company_id'] for company in directory.json()} == {3, 4, 5}
+            company_a = next(company for company in directory.json() if company['company_id'] == 3)
+            assert company_a['reps_count'] == 1
+            assert company_a['available_contact']
             handoff = client.post('/api/ai/human-handoff', headers={'Authorization': f'Bearer {doctor_token}'}, json={'message': 'Connect me to sales'})
             assert handoff.status_code == 200, handoff.text
             assert handoff.json()['status'] == 'company_selection'
@@ -169,7 +176,7 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
             started = client.post(
                 '/api/conversations',
                 headers={'Authorization': f'Bearer {doctor_token}'},
-                json={'company_id': 101},
+                json={'company_id': 3},
             )
             assert started.status_code == 200, started.text
             conversation = started.json()
@@ -180,6 +187,15 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
             assert ticket['sales_representative_id'] == 6
             assert ticket['ticket_no'].startswith('TKT-')
             assert ticket['status'] == 'Open'
+            reopened = client.post(
+                '/api/conversations',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'company_id': 3},
+            )
+            assert reopened.status_code == 200, reopened.text
+            assert reopened.json()['id'] == conversation['id']
+            assert reopened.json()['ticket_id'] == ticket['id']
+            assert reopened.json()['company_id'] == 101
 
             sent = client.post(
                 f'/api/human-conversations/{conversation["id"]}/messages',
@@ -243,6 +259,18 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
             assert reopened.status_code == 200, reopened.text
             assert client.get('/api/tickets', headers={'Authorization': f'Bearer {company_a_token}'}).json()[0]['status'] == 'Reopened'
 
+            company_b_start = client.post(
+                '/api/conversations',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'company_id': 4},
+            )
+            assert company_b_start.status_code == 200, company_b_start.text
+            company_b_ticket = company_b_start.json()['ticket']
+            assert company_b_start.json()['company_id'] == 102
+            assert company_b_ticket['sales_representative_id'] == 7
+            assert {item['ticket_no'] for item in client.get('/api/tickets', headers={'Authorization': f'Bearer {company_a_token}'}).json()} == {ticket['ticket_no']}
+            assert {item['ticket_no'] for item in client.get('/api/tickets', headers={'Authorization': f'Bearer {company_b_token}'}).json()} == {company_b_ticket['ticket_no']}
+
             denied = client.get(
                 f'/api/human-conversations/{conversation["id"]}',
                 headers={'Authorization': f'Bearer {doctor_b_token}'},
@@ -252,7 +280,7 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
         cleanup_temp_db(db_path)
 
 
-def test_company_without_eligible_rep_is_not_offered_as_available_or_chat_created():
+def test_company_without_eligible_rep_opens_company_owned_waiting_conversation():
     db_path = setup_temp_db()
     try:
         seed_company_chat_data(db_path)
@@ -261,6 +289,7 @@ def test_company_without_eligible_rep_is_not_offered_as_available_or_chat_create
             conn.commit()
         with TestClient(main.app) as client:
             doctor_token = main.token({'id': 1, 'role': 'doctor'})
+            company_c_token = main.token({'id': 5, 'role': 'pharma', 'company_user_id': 103})
             directory = client.get('/api/doctor/pharma-companies', headers={'Authorization': f'Bearer {doctor_token}'})
             assert directory.status_code == 200, directory.text
             company = next(item for item in directory.json() if item['company_id'] == 5)
@@ -272,8 +301,46 @@ def test_company_without_eligible_rep_is_not_offered_as_available_or_chat_create
                 headers={'Authorization': f'Bearer {doctor_token}'},
                 json={'company_id': 5},
             )
-            assert response.status_code == 404
-            assert 'unavailable for live chat' in response.json()['detail']
+            assert response.status_code == 200, response.text
+            conversation = response.json()
+            assert conversation['id'] == 3
+            assert conversation['sales_representative_id'] is None
+            assert conversation['ticket_status'] == 'Waiting for Company'
+
+            repeated = client.post(
+                '/api/conversations',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'company_id': 5},
+            )
+            assert repeated.status_code == 200, repeated.text
+            assert repeated.json()['id'] == conversation['id']
+            assert repeated.json()['ticket_id'] == conversation['ticket_id']
+            with sqlite3.connect(db_path) as conn:
+                assert conn.execute('SELECT COUNT(*) FROM tickets WHERE conversation_id=?', (conversation['id'],)).fetchone()[0] == 1
+            sent = client.post(
+                f'/api/human-conversations/{conversation["id"]}/messages',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'content': 'Please route my request to company support.'},
+            )
+            assert sent.status_code == 200, sent.text
+            company_detail = client.get(
+                f'/api/human-conversations/{conversation["id"]}',
+                headers={'Authorization': f'Bearer {company_c_token}'},
+            )
+            assert company_detail.status_code == 200, company_detail.text
+            assert company_detail.json()['ticket']['status'] == 'Waiting for Company'
+            assert company_detail.json()['messages'][0]['content'] == 'Please route my request to company support.'
+            reply = client.post(
+                f'/api/human-conversations/{conversation["id"]}/messages',
+                headers={'Authorization': f'Bearer {company_c_token}'},
+                json={'content': 'A company support colleague will take this conversation.'},
+            )
+            assert reply.status_code == 200, reply.text
+            doctor_detail = client.get(
+                f'/api/human-conversations/{conversation["id"]}',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+            )
+            assert doctor_detail.json()['messages'][-1]['content'] == 'A company support colleague will take this conversation.'
             chats = client.get('/api/human-conversations', headers={'Authorization': f'Bearer {doctor_token}'}).json()
             assert {chat['id'] for chat in chats} == {1, 2, 3}
     finally:

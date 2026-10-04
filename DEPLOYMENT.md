@@ -56,7 +56,7 @@ Restart/redeploy after changing environment values. Do not paste secrets into Gi
 
 1. Import this repository and set the project root directory to `frontend`.
 2. Use `npm run build` as the build command and `dist` as the output directory.
-3. Set the Vercel environment variable `VITE_API_URL` to `https://pharmaai-sales-api.onrender.com` (the current Render service URL), for Production and any environments you deploy.
+3. Set the Vercel environment variable `VITE_API_URL` to `https://pharma-ai-sales-system.onrender.com` (the active Render API URL used by the production frontend), for Production and any environments you deploy. If the Render service URL changes, update this value to the URL shown for that service.
 4. Set `CLIENT_URL` in Render to the exact Vercel production origin shown above. Add preview origins to `CORS_ORIGINS` only when needed.
 
 No database or API secret belongs in Vercel. The browser calls `${VITE_API_URL}/api/...` directly.

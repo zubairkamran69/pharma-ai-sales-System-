@@ -145,6 +145,7 @@ async function api(path, opt = {}) {
     const h = { 'Content-Type': 'application/json', ...(opt.headers || {}) };
     if (token) h.Authorization = 'Bearer ' + token;
     const url = API + path;
+    const method = String(opt.method || 'GET').toUpperCase();
     let r;
     try {
         r = await fetch(url, { ...opt, headers: h });
@@ -155,12 +156,22 @@ async function api(path, opt = {}) {
         // Never fall back to window.location.origin: every production request has
         // to go to the single configured API base.
         const target = API_URL || 'the configured VITE_API_URL (not set)';
-        throw Error(`Cannot reach the PharmaAI API at ${target}. Check your connection, the VITE_API_URL build variable and the Render CLIENT_URL / CORS settings. (${networkError.message})`);
+        const error = Error(`Cannot reach the PharmaAI API at ${target}. Check your connection, the VITE_API_URL build variable and the Render CLIENT_URL / CORS settings. (${networkError.message})`);
+        error.url = url;
+        error.method = method;
+        error.status = null;
+        error.responseBody = networkError.message;
+        throw error;
     }
     if (!r.ok) {
         const detail = await readApiError(r);
         if (r.status === 401 && path !== '/auth/login') { handleUnauthorized(detail || 'Your session has expired. Please sign in again.'); }
-        throw Error(detail || `API request ${path} failed (HTTP ${r.status} ${r.statusText})`);
+        const error = Error(detail || `API request ${path} failed (HTTP ${r.status} ${r.statusText})`);
+        error.url = url;
+        error.method = method;
+        error.status = r.status;
+        error.responseBody = detail || r.statusText;
+        throw error;
     }
     let payload;
     try { payload = await r.json(); } catch (_) { throw Error(`API request ${path} returned a non-JSON response (HTTP ${r.status}).`); }
@@ -268,16 +279,30 @@ async function sendChat() {
 function formatText(s) { return esc(s).replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>') }
 async function contactRep(mid) { try { const x = await api('/contact-rep/' + mid, { method: 'POST' }); humanConversationId = x.conversation_id; toast(`Connected to ${x.representative.name}`); go('human') } catch (e) { toast(e.message) } }
 async function startCompanyConversation(companyId) {
+    const requestUrl = `${API}/conversations`;
+    const selectedCompanyId = Number(companyId);
+    const authenticatedUserId = me?.id ?? null;
     try {
+        if (!Number.isInteger(selectedCompanyId) || selectedCompanyId <= 0) throw Error('The selected company ID is invalid. Refresh the company list and try again.');
         const x = await api('/conversations', {
             method: 'POST',
-            body: JSON.stringify({ company_id: companyId })
+            body: JSON.stringify({ company_id: selectedCompanyId })
         });
         humanConversationId = x.id || x.conversation_id;
+        if (!humanConversationId) throw Error('The API did not return a conversation ID. Please retry.');
         toast(`Connected · ${x.ticket?.ticket_no || 'support ticket opened'}`);
         go('human');
     } catch (e) {
-        toast(e.message.includes('unavailable') ? 'No sales representative is currently available for this company.' : 'Unable to start this conversation. Please try again.');
+        console.error('[company-chat] conversation request failed', {
+            url: e.url || requestUrl,
+            method: e.method || 'POST',
+            status: e.status ?? null,
+            responseBody: e.responseBody || e.message,
+            selectedCompanyId,
+            authenticatedUserId,
+            authenticated: Boolean(token)
+        });
+        toast(e.message || 'Unable to start this conversation. Please try again.');
     }
 }
 function filterDoctorCompanies() {
@@ -301,6 +326,12 @@ async function updateHumanTicket(ticketId, status) {
         toast(e.message);
     }
 }
+function humanRepLabel(conversation) {
+    if (conversation.representative || conversation.representative_name) return conversation.representative || conversation.representative_name;
+    return String(conversation.ticket_status || conversation.ticket?.status || '').toLowerCase() === 'waiting for company'
+        ? 'Awaiting representative assignment'
+        : 'Sales representative';
+}
 async function human(el) {
     if (role === 'doctor') {
         const [companyResult, chatResult] = await Promise.allSettled([
@@ -309,11 +340,11 @@ async function human(el) {
         ]);
         const companies = companyResult.status === 'fulfilled' ? companyResult.value : [];
         const chats = chatResult.status === 'fulfilled' ? chatResult.value : [];
-        const chatList = chats.length ? chats.map(c => `<button class="chat-item ${humanConversationId === c.id ? 'active' : ''}" onclick="openHuman(${c.id})"><b>${esc(c.company || 'Pharmaceutical company')}</b><span>${esc(c.medicine || 'Company conversation')}</span><small>${esc(c.representative || 'Sales representative')} · ${esc(c.ticket_no || 'Ticket pending')} · ${esc(c.ticket_status || c.status || 'Open')}</small></button>`).join('') : '<div class="empty">No conversations yet. Choose a pharmaceutical company below to start human support.</div>';
+            const chatList = chats.length ? chats.map(c => `<button class="chat-item ${humanConversationId === c.id ? 'active' : ''}" onclick="openHuman(${c.id})"><b>${esc(c.company || 'Pharmaceutical company')}</b><span>${esc(c.medicine || 'Company conversation')}</span><small>${esc(humanRepLabel(c))} · ${esc(c.ticket_no || 'Ticket pending')} · ${esc(c.ticket_status || c.status || 'Open')}</small></button>`).join('') : '<div class="empty">No conversations yet. Choose a pharmaceutical company below to start human support.</div>';
         const companyCards = companies.length ? companies.map(company => {
             const companyName = company.company_name || company.company || 'Pharma company';
             const approved = ['approved', 'verified'].includes(String(company.verification_status || '').toLowerCase());
-            return `<div class="company-option" data-company-name="${esc(companyName.toLowerCase())}" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px;margin-bottom:9px;border:1px solid var(--line);border-radius:10px;background:#fff"><div><b>${esc(companyName)}</b><span style="display:block;margin-top:5px;color:var(--forest);font-size:10px;font-weight:700">${approved ? '✓ Verified' : 'Demo account'}</span><small style="display:block;margin-top:4px;color:var(--muted)">${company.available_contact ? 'Sales support available' : 'No sales representative currently available'}</small><small style="display:block;margin-top:3px;color:var(--muted)">${company.products_count ?? 0} products</small></div><button class="primary small" type="button" ${company.available_contact ? '' : 'disabled'} onclick="startCompanyConversation(${company.company_id})">Chat</button></div>`;
+            return `<div class="company-option" data-company-name="${esc(companyName.toLowerCase())}" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px;margin-bottom:9px;border:1px solid var(--line);border-radius:10px;background:#fff"><div><b>${esc(companyName)}</b><span style="display:block;margin-top:5px;color:var(--forest);font-size:10px;font-weight:700">${approved ? '✓ Verified' : 'Demo account'}</span><small style="display:block;margin-top:4px;color:var(--muted)">${company.available_contact ? 'Sales support available' : 'No rep available yet; your chat will go to company support'}</small><small style="display:block;margin-top:3px;color:var(--muted)">${company.products_count ?? 0} products</small></div><button class="primary small" type="button" title="Start or reopen this company conversation" onclick="startCompanyConversation(${company.company_id})">Chat</button></div>`;
         }).join('') : companyResult.status === 'rejected' ? '<div class="empty">Unable to load pharmaceutical companies. Please try again.</div>' : '<div class="empty">No verified pharmaceutical companies are available right now.</div>';
         const companyError = companyResult.status === 'rejected' ? '<button class="secondary small" onclick="loadPage()">Retry</button>' : '';
         el.innerHTML = hero('HUMAN COMPANY SUPPORT', 'Talk to a real sales representative', 'Choose an approved pharmaceutical company to open a secure human conversation with its sales team.', '<span class="tag">' + companies.length + ' COMPANIES</span>') + `<div class="human-layout"><div class="card chat-list"><div class="head"><h3>My company conversations</h3><span class="tag">${chats.length} chats</span></div>${chatResult.status === 'rejected' ? '<div class="empty">Unable to load conversations. Please try again.</div>' : chatList}<div class="head company-list-head"><h3>Pharmaceutical companies</h3>${companyError}</div><div class="field company-search"><input id="companySearch" type="search" placeholder="Search companies..." oninput="filterDoctorCompanies()" aria-label="Search pharmaceutical companies"></div><div id="humanCompanyResults">${companyCards}</div></div><div class="card chat" id="humanPanel"><div class="empty">Select a company or conversation to open human support.</div></div></div>`;
@@ -321,7 +352,7 @@ async function human(el) {
         return;
     }
     const cs = await api('/human-conversations');
-    const list = cs.length ? cs.map(c => `<button class="chat-item ${humanConversationId === c.id ? 'active' : ''}" data-conversation-id="${c.id}" onclick="openHuman(${c.id})"><b>${esc(c.company || c.doctor || 'Company')}</b><span>${esc(c.medicine || 'Company conversation')}</span><small>${esc(c.representative || 'Sales representative')} · ${esc(c.ticket_no || 'Ticket pending')} · ${esc(c.ticket_status || 'Open')}</small></button>`).join('') : '<div class="empty">No human conversations yet.</div>';
+    const list = cs.length ? cs.map(c => `<button class="chat-item ${humanConversationId === c.id ? 'active' : ''}" data-conversation-id="${c.id}" onclick="openHuman(${c.id})"><b>${esc(c.company || c.doctor || 'Company')}</b><span>${esc(c.medicine || 'Company conversation')}</span><small>${esc(humanRepLabel(c))} · ${esc(c.ticket_no || 'Ticket pending')} · ${esc(c.ticket_status || 'Open')}</small></button>`).join('') : '<div class="empty">No human conversations yet.</div>';
     el.innerHTML = hero('DOCTOR CONVERSATIONS', 'Human sales support', 'Private human-to-human conversations with company sales representatives.', '<span class="tag">' + cs.length + ' CHATS</span>') + `<div class="human-layout"><div class="card chat-list"><div class="head"><h3>${role === 'pharma' ? 'Incoming support' : 'My support conversations'}</h3><span class="tag">${cs.length}</span></div>${list}</div><div class="card chat" id="humanPanel"><div class="empty">Select a conversation to open the secure human chat.</div></div></div>`;
     if (humanConversationId) openHuman(humanConversationId);
 }
@@ -340,6 +371,8 @@ async function openHuman(cid) {
         if (!p) return;
         const c = x.conversation, ticket = x.ticket;
         const status = ticket?.status || 'Open';
+        const representativeLabel = humanRepLabel({ ...c, ticket_status: status });
+        const representativeRole = c.representative_name ? 'Sales Representative' : status === 'Waiting for Company' ? 'Company support' : 'Sales Representative';
         const statusOptions = ['Open', 'In Progress', 'Waiting for Doctor', 'Waiting for Company', 'Resolved', 'Reopened', 'Closed'];
         const statusControl = !ticket ? '' : role === 'doctor'
             ? status === 'Resolved' || status === 'Closed'
@@ -347,7 +380,7 @@ async function openHuman(cid) {
                 : `<button class="secondary small" onclick="updateHumanTicket(${ticket.id},'Resolved')">Mark as resolved</button>`
             : `<select aria-label="Update support ticket status" onchange="updateHumanTicket(${ticket.id},this.value)">${statusOptions.map(option => `<option value="${option}" ${option.toLowerCase() === status.toLowerCase() ? 'selected' : ''}>${option}</option>`).join('')}</select>`;
         const timeline = (x.ticket_events || []).map(event => `<span>${esc(event.event_type.replace(/_/g, ' '))}${event.new_status ? ` · ${esc(event.new_status)}` : ''}${event.actor_name ? ` · ${esc(event.actor_name)}` : ''}</span>`).join('');
-        p.innerHTML = `<div class="agent-head"><div class="agent-id"><div class="orb">◌</div><div><b>${esc(c.company_name || 'Pharmaceutical company')}</b><span>${esc(c.representative_name || 'Sales representative')} · Sales Representative</span></div></div><span class="online">● HUMAN</span></div><div class="human-ticket-summary" id="humanTicketSummary" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 14px;border-bottom:1px solid var(--line);background:#f8faf5;font-size:11px">${ticket ? `<b>Support Ticket: ${esc(ticket.ticket_no)}</b><span>Status: <strong id="humanTicketStatus">${esc(status)}</strong></span><div class="human-ticket-actions">${statusControl}</div>${timeline ? `<div class="human-ticket-events" style="flex-basis:100%;display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:10px">${timeline}</div>` : ''}` : '<span>No linked support ticket.</span>'}</div><div class="chatbody" id="humanBody">${humanMessageMarkup(x.messages || [])}</div><div class="chatbar"><input id="humanInput" placeholder="Write a message…" onkeydown="if(event.key==='Enter')sendHuman()"><button aria-label="Send message" onclick="sendHuman()">↑</button></div>`;
+        p.innerHTML = `<div class="agent-head"><div class="agent-id"><div class="orb">◌</div><div><b>${esc(c.company_name || 'Pharmaceutical company')}</b><span>${esc(representativeLabel)} · ${esc(representativeRole)}</span></div></div><span class="online">● HUMAN</span></div><div class="human-ticket-summary" id="humanTicketSummary" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 14px;border-bottom:1px solid var(--line);background:#f8faf5;font-size:11px">${ticket ? `<b>Support Ticket: ${esc(ticket.ticket_no)}</b><span>Status: <strong id="humanTicketStatus">${esc(status)}</strong></span><div class="human-ticket-actions">${statusControl}</div>${timeline ? `<div class="human-ticket-events" style="flex-basis:100%;display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:10px">${timeline}</div>` : ''}` : '<span>No linked support ticket.</span>'}</div><div class="chatbody" id="humanBody">${humanMessageMarkup(x.messages || [])}</div><div class="chatbar"><input id="humanInput" placeholder="Write a message…" onkeydown="if(event.key==='Enter')sendHuman()"><button aria-label="Send message" onclick="sendHuman()">↑</button></div>`;
         document.getElementById('humanBody').scrollTop = 999999;
         clearInterval(humanRefreshTimer);
         humanRefreshTimer = setInterval(refreshHumanConversation, 5000);
@@ -368,7 +401,7 @@ async function refreshHumanConversation() {
         if (status && detail.ticket) status.textContent = detail.ticket.status;
         conversations.forEach(conversation => {
             const entry = document.querySelector(`[data-conversation-id="${conversation.id}"] small`);
-            if (entry) entry.textContent = `${conversation.representative || 'Sales representative'} · ${conversation.ticket_no || 'Ticket pending'} · ${conversation.ticket_status || 'Open'}`;
+            if (entry) entry.textContent = `${humanRepLabel(conversation)} · ${conversation.ticket_no || 'Ticket pending'} · ${conversation.ticket_status || 'Open'}`;
         });
     } catch (_) {
         // Polling is best-effort; the next interval retries without interrupting message entry.
