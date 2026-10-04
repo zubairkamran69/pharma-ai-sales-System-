@@ -111,7 +111,7 @@ async function confirmLogout() {
         renderAuth();
     }
 }
-async function api(path, opt = {}) { const h = { 'Content-Type': 'application/json', ...(opt.headers || {}) }; if (token) h.Authorization = 'Bearer ' + token; const r = await fetch(API + path, { ...opt, headers: h }); const x = await r.json().catch(() => ({ detail: 'Request failed' })); if (!r.ok) { if (r.status === 401 && path !== '/auth/login') { handleUnauthorized(x.detail || 'Your session has expired. Please sign in again.'); } throw Error(x.detail || 'Request failed'); } return x }
+async function api(path, opt = {}) { const h = { 'Content-Type': 'application/json', ...(opt.headers || {}) }; if (token) h.Authorization = 'Bearer ' + token; let r; try { r = await fetch(API + path, { ...opt, headers: h }); } catch (_) { throw Error('Cannot reach the Render API. Check VITE_API_URL and Render CLIENT_URL/CORS settings.'); } const x = await r.json().catch(() => ({ detail: 'Request failed' })); if (!r.ok) { if (r.status === 401 && path !== '/auth/login') { handleUnauthorized(x.detail || 'Your session has expired. Please sign in again.'); } throw Error(x.detail || `API request failed (${r.status})`); } return x }
 function render() {
     const path = window.location.pathname || '/';
     const protectedPaths = ['/dashboard', '/pharma', '/doctor', '/sales', '/owner'];

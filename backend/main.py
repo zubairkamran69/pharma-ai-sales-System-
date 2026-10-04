@@ -154,7 +154,7 @@ _configured_database_url = DATABASE_URL
 _configured_jwt_secret = SECRET
 app=FastAPI(title='PharmaAI Sales Agent',version='3.0.0')
 cors_origins = [origin.strip().rstrip('/') for origin in os.getenv('CORS_ORIGINS', '').split(',') if origin.strip()]
-client_url = os.getenv('CLIENT_URL', '').strip().rstrip('/')
+client_url = (os.getenv('CLIENT_URL') or 'https://pharma-ai-sales-system-frontend.vercel.app').strip().rstrip('/')
 if client_url and client_url not in cors_origins:
     cors_origins.append(client_url)
 if not cors_origins:

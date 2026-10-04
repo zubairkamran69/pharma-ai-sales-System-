@@ -373,3 +373,53 @@ def test_company_isolated_human_chats_reject_cross_company_access():
             assert blocked_owner.status_code == 403, blocked_owner.text
     finally:
         cleanup_temp_db(db_path)
+
+
+def test_platform_owner_can_list_pending_users_with_vercel_cors(monkeypatch):
+    monkeypatch.setenv('DEMO_VERIFICATION', 'false')
+    db_path = setup_temp_db()
+    frontend_origin = 'https://pharma-ai-sales-system-frontend.vercel.app'
+    try:
+        with TestClient(main.app) as client:
+            registration = client.post(
+                '/api/auth/register',
+                json={
+                    'name': 'Pending Verification Doctor',
+                    'email': 'pending.verification@test.local',
+                    'password': 'pending-doctor-test-password',
+                    'role': 'doctor',
+                    'specialization': 'Cardiology',
+                    'license_number': 'TEST-REG-987',
+                    'registration_authority': 'Test Registry'
+                },
+            )
+            assert registration.status_code == 200, registration.text
+            assert registration.json()['status'] == 'pending'
+
+            admin = client.post(
+                '/api/auth/login',
+                json={'email': 'admin@pharmaai.local', 'password': 'admin123', 'role': 'admin'},
+            )
+            assert admin.status_code == 200, admin.text
+            headers = {
+                'Authorization': f"Bearer {admin.json()['token']}",
+                'Origin': frontend_origin,
+            }
+            users = client.get('/api/admin/users', headers=headers)
+            assert users.status_code == 200, users.text
+            pending_user = next(user for user in users.json() if user['email'] == 'pending.verification@test.local')
+            assert pending_user['verification_status'] == 'pending'
+            assert users.headers['access-control-allow-origin'] == frontend_origin
+
+            preflight = client.options(
+                '/api/admin/users',
+                headers={
+                    'Origin': frontend_origin,
+                    'Access-Control-Request-Method': 'GET',
+                    'Access-Control-Request-Headers': 'authorization',
+                },
+            )
+            assert preflight.status_code == 200, preflight.text
+            assert preflight.headers['access-control-allow-origin'] == frontend_origin
+    finally:
+        cleanup_temp_db(db_path)
