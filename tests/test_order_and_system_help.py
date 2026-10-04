@@ -13,6 +13,7 @@ def cleanup_temp_db(db_path):
     main.db = main._production_db
     main.DATABASE_URL = main._configured_database_url
     main.SECRET = main._configured_jwt_secret
+    main.DB_INTEGRITY_ERRORS = main._configured_db_integrity_errors
     try:
         os.unlink(db_path)
     except FileNotFoundError:
@@ -30,6 +31,7 @@ def setup_temp_db():
     main.DB = temp_db.name
     main.DATABASE_URL = 'postgresql://isolated-test.invalid/test'
     main.SECRET = 'isolated-test-secret-value-at-least-32-chars'
+    main.DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
     def connect_test_db():
         conn = sqlite3.connect(main.DB)
         conn.row_factory = sqlite3.Row

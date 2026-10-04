@@ -49,3 +49,5 @@ def test_no_native_prompt_or_confirm_in_frontend():
     text = js.read_text(encoding="utf-8")
     assert "prompt(" not in text, "Native prompt() was used in the frontend"
     assert "confirm(" not in text, "Native confirm() was used in the frontend"
+    assert 'value="admin@pharmaai.local"' not in text
+    assert 'value="admin123"' not in text

@@ -14,6 +14,7 @@ def cleanup_temp_db(db_path):
     main.db = main._production_db
     main.DATABASE_URL = main._configured_database_url
     main.SECRET = main._configured_jwt_secret
+    main.DB_INTEGRITY_ERRORS = main._configured_db_integrity_errors
     try:
         os.unlink(db_path)
     except FileNotFoundError:
@@ -31,6 +32,7 @@ def setup_temp_db():
     main.DB = temp_db.name
     main.DATABASE_URL = 'postgresql://isolated-test.invalid/test'
     main.SECRET = 'isolated-test-secret-value-at-least-32-chars'
+    main.DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
     def connect_test_db():
         conn = sqlite3.connect(main.DB)
         conn.row_factory = sqlite3.Row
@@ -224,5 +226,82 @@ def test_legacy_password_is_verified_and_upgraded_on_login():
 
         assert stored_hash.startswith('pbkdf2_sha256$')
         assert stored_hash != legacy_hash
+    finally:
+        cleanup_temp_db(db_path)
+
+
+def test_register_login_jwt_and_protected_route_flow(monkeypatch):
+    db_path = setup_temp_db()
+    monkeypatch.setenv('DEMO_VERIFICATION', 'true')
+    try:
+        with TestClient(main.app) as client:
+            registration = client.post(
+                '/api/auth/register',
+                json={
+                    'name': 'Registration Test Doctor',
+                    'email': 'registration.flow@test.local',
+                    'password': 'test-registration-password',
+                    'role': 'doctor',
+                    'specialization': 'Cardiology',
+                    'license_number': 'DEMO-REG-123',
+                    'registration_authority': 'Test Registry'
+                },
+            )
+            assert registration.status_code == 200, registration.text
+            assert registration.json()['user']['email'] == 'registration.flow@test.local'
+            assert 'password' not in registration.json()['user']
+
+            with sqlite3.connect(db_path) as conn:
+                stored_hash = conn.execute(
+                    'SELECT password FROM users WHERE email=?',
+                    ('registration.flow@test.local',),
+                ).fetchone()[0]
+            assert stored_hash.startswith('pbkdf2_sha256$')
+
+            login_response = client.post(
+                '/api/auth/login',
+                json={'email': 'registration.flow@test.local', 'password': 'test-registration-password', 'role': 'doctor'},
+            )
+            assert login_response.status_code == 200, login_response.text
+            access_token = login_response.json()['token']
+            protected = client.get('/api/auth/me', headers={'Authorization': f'Bearer {access_token}'})
+            assert protected.status_code == 200, protected.text
+            assert protected.json()['email'] == 'registration.flow@test.local'
+
+            duplicate = client.post(
+                '/api/auth/register',
+                json={
+                    'name': 'Duplicate Doctor',
+                    'email': 'registration.flow@test.local',
+                    'password': 'another-password',
+                    'role': 'doctor',
+                    'license_number': 'DEMO-REG-456'
+                },
+            )
+            assert duplicate.status_code == 409
+    finally:
+        cleanup_temp_db(db_path)
+
+
+def test_configured_admin_and_demo_accounts_are_idempotent(monkeypatch):
+    db_path = setup_temp_db()
+    monkeypatch.setenv('ADMIN_EMAIL', 'configured.admin@test.local')
+    monkeypatch.setenv('ADMIN_PASSWORD', 'test-admin-password')
+    monkeypatch.setenv('DEMO_USER_EMAIL', 'configured.demo@test.local')
+    monkeypatch.setenv('DEMO_USER_PASSWORD', 'test-demo-password')
+    try:
+        main.init()
+        main.init()
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute('SELECT count(*) FROM users WHERE email=?', ('configured.admin@test.local',)).fetchone()[0] == 1
+            assert conn.execute('SELECT count(*) FROM users WHERE email=?', ('configured.demo@test.local',)).fetchone()[0] == 1
+
+        with TestClient(main.app) as client:
+            admin_login = client.post('/api/auth/login', json={'email': 'configured.admin@test.local', 'password': 'test-admin-password', 'role': 'admin'})
+            demo_login = client.post('/api/auth/login', json={'email': 'configured.demo@test.local', 'password': 'test-demo-password', 'role': 'doctor'})
+            assert admin_login.status_code == 200, admin_login.text
+            assert demo_login.status_code == 200, demo_login.text
+            assert 'password' not in admin_login.json()['user']
+            assert 'password' not in demo_login.json()['user']
     finally:
         cleanup_temp_db(db_path)

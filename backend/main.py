@@ -5,6 +5,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import hashlib, secrets, os, jwt, datetime, json, re, urllib.request, uuid, math
+import logging
 import sys
 from pathlib import Path
 
@@ -26,9 +27,11 @@ BASE=os.path.dirname(__file__)
 DATABASE_URL = os.getenv('DATABASE_URL') or None
 SECRET=os.getenv('JWT_SECRET') or os.getenv('PHARMAAI_SECRET')
 DB_INTEGRITY_ERRORS = (psycopg2.IntegrityError,) if psycopg2 is not None else ()
+_configured_db_integrity_errors = DB_INTEGRITY_ERRORS
 ACCESS_TOKEN_EXPIRE_MINUTES=int(os.getenv('ACCESS_TOKEN_EXPIRE_MINUTES','720'))
 PMDC_URL='https://www.pmdc.pk/Home?keyWord=registration'
 JWT_BLACKLIST=set()
+auth_logger = logging.getLogger('pharmaai.auth')
 
 
 def _normalize_sql_for_postgres(sql):
@@ -881,13 +884,20 @@ class HumanMessage(BaseModel): content:str
 
 @app.post('/api/auth/login')
 def login(x:Login):
+    auth_logger.info('Login attempt received')
     requested_role = (x.role or '').strip().lower()
     allowed_roles = {'admin', 'doctor', 'pharma', 'sales_rep'}
     if requested_role and requested_role not in allowed_roles:
         raise HTTPException(400, 'Invalid account role')
 
-    c=db(); u=c.execute('select * from users where email=?',(x.email.lower(),)).fetchone(); c.close()
-    if not u or not pverify(x.password,u['password']): raise HTTPException(401,'Incorrect email or password')
+    c=db(); u=c.execute('select * from users where email=?',(x.email.strip().lower(),)).fetchone(); c.close()
+    if not u:
+        auth_logger.warning('Login user not found')
+        raise HTTPException(401,'Incorrect email or password')
+    if not pverify(x.password,u['password']):
+        auth_logger.warning('Login password verification failed')
+        raise HTTPException(401,'Incorrect email or password')
+    auth_logger.info('Login password verification succeeded')
     if not u['password'].startswith('pbkdf2_sha256$'):
         c=db(); c.execute('update users set password=? where id=? and password=?',(phash(x.password),u['id'],u['password'])); c.commit(); c.close()
     d=row(u); d.pop('password',None)
@@ -895,7 +905,9 @@ def login(x:Login):
         raise HTTPException(403, 'Selected role does not match the account type')
     if d.get('verification_status') not in ('approved','demo') and d['role']!='admin':
         return {'pending':True,'status':d.get('verification_status'),'message':'Your account is registered but awaits owner verification.','user':d}
-    return {'token':token(d),'user':d}
+    access_token = token(d)
+    auth_logger.info('Login token generated')
+    return {'token':access_token,'user':d}
 @app.post('/api/auth/logout')
 def logout(authorization: str|None=Header(default=None)):
     if authorization:
