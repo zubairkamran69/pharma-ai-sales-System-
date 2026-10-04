@@ -1,4 +1,5 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
 
@@ -160,13 +161,19 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
 
             with sqlite3.connect(db_path) as conn:
                 conn.execute('UPDATE conversations SET company_id=3, company_user_id=101 WHERE id=1')
+                conn.execute('UPDATE conversations SET sales_rep_id=NULL, sales_representative_id=NULL, assigned_at=NULL WHERE id=1')
+                conn.execute('UPDATE conversations SET sales_rep_id=NULL, sales_representative_id=NULL, assigned_at=NULL WHERE id=2')
+                conn.execute(
+                    "INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id) VALUES(?,?,?,?,?,?,?,?)",
+                    ('Rep A2', 'rep.a2@test.local', main.phash('secret'), 'sales_rep', 'Company A', main.now(), 'approved', 101),
+                )
                 conn.commit()
 
             directory = client.get('/api/doctor/pharma-companies', headers={'Authorization': f'Bearer {doctor_token}'})
             assert directory.status_code == 200, directory.text
             assert {company['company_id'] for company in directory.json()} == {3, 4, 5}
             company_a = next(company for company in directory.json() if company['company_id'] == 3)
-            assert company_a['reps_count'] == 1
+            assert company_a['reps_count'] == 2
             assert company_a['available_contact']
             handoff = client.post('/api/ai/human-handoff', headers={'Authorization': f'Bearer {doctor_token}'}, json={'message': 'Connect me to sales'})
             assert handoff.status_code == 200, handoff.text
@@ -184,7 +191,7 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
             assert ticket['conversation_id'] == conversation['id']
             assert ticket['doctor_id'] == 1
             assert ticket['company_id'] == 101
-            assert ticket['sales_representative_id'] == 6
+            assert ticket['sales_representative_id'] is None
             assert ticket['ticket_no'].startswith('TKT-')
             assert ticket['status'] == 'Open'
             reopened = client.post(
@@ -196,6 +203,45 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
             assert reopened.json()['id'] == conversation['id']
             assert reopened.json()['ticket_id'] == ticket['id']
             assert reopened.json()['company_id'] == 101
+
+            rep_a2_token = main.token({'id': 9, 'role': 'sales_rep', 'company_user_id': 101})
+            rep_a_available = client.get('/api/human-conversations', headers={'Authorization': f'Bearer {rep_a_token}'})
+            rep_a2_available = client.get('/api/human-conversations', headers={'Authorization': f'Bearer {rep_a2_token}'})
+            assert conversation['id'] in {item['id'] for item in rep_a_available.json()}
+            assert conversation['id'] in {item['id'] for item in rep_a2_available.json()}
+            unclaimed_message = client.post(
+                f'/api/human-conversations/{conversation["id"]}/messages',
+                headers={'Authorization': f'Bearer {rep_a_token}'},
+                json={'content': 'I will take this case.'},
+            )
+            assert unclaimed_message.status_code == 409
+            unclaimed_legacy_message = client.post(
+                f'/api/conversations/{conversation["id"]}/messages',
+                headers={'Authorization': f'Bearer {rep_a_token}'},
+                json={'content': 'I will take this case.'},
+            )
+            assert unclaimed_legacy_message.status_code == 409
+            claimed = client.post(f'/api/human-conversations/{conversation["id"]}/claim', headers={'Authorization': f'Bearer {rep_a_token}'})
+            assert claimed.status_code == 200, claimed.text
+            assert claimed.json()['sales_representative_id'] == 6
+            assert claimed.json()['ticket_status'] == 'Assigned'
+            competing_claim = client.post(f'/api/human-conversations/{conversation["id"]}/claim', headers={'Authorization': f'Bearer {rep_a2_token}'})
+            assert competing_claim.status_code == 409
+            assert 'already being handled' in competing_claim.json()['detail']
+            assert client.get(f'/api/human-conversations/{conversation["id"]}', headers={'Authorization': f'Bearer {rep_a2_token}'}).status_code == 403
+            cross_company_claim = client.post(f'/api/human-conversations/{conversation["id"]}/claim', headers={'Authorization': f'Bearer {rep_b_token}'})
+            assert cross_company_claim.status_code == 403
+            company_override = client.post(
+                f'/api/conversations/{conversation["id"]}/assign',
+                headers={'Authorization': f'Bearer {company_a_token}'},
+                json={'sales_representative_id': 9},
+            )
+            assert company_override.status_code == 409
+            peer_notifications = client.get('/api/notifications', headers={'Authorization': f'Bearer {rep_a2_token}'}).json()
+            assert any(item['type'] == 'human_chat_assigned' for item in peer_notifications)
+            assert client.get('/api/notifications', headers={'Authorization': f'Bearer {rep_b_token}'}).json() == []
+            assert {item['id'] for item in client.get('/api/tickets', headers={'Authorization': f'Bearer {rep_a2_token}'}).json()} == {ticket['id']}
+            assert client.get('/api/tickets', headers={'Authorization': f'Bearer {rep_b_token}'}).json() == []
 
             sent = client.post(
                 f'/api/human-conversations/{conversation["id"]}/messages',
@@ -250,7 +296,24 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
                 json={'status': 'RESOLVED'},
             )
             assert resolved.status_code == 200, resolved.text
+            assert resolved.json()['ticket']['status'] == 'Pending Confirmation'
+            confirmation = client.patch(
+                f'/api/tickets/{ticket["id"]}',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'resolution_confirmation': 'yes'},
+            )
+            assert confirmation.status_code == 200, confirmation.text
+            assert confirmation.json()['ticket']['status'] == 'Resolved'
+            assert confirmation.json()['ticket']['doctor_resolution'] == 'yes'
+            assert confirmation.json()['ticket']['resolved_by'] == 1
             assert client.get('/api/tickets', headers={'Authorization': f'Bearer {doctor_token}'}).json()[0]['status'] == 'Resolved'
+            assert any(item['title'] == 'Support request resolved' for item in client.get('/api/notifications', headers={'Authorization': f'Bearer {doctor_token}'}).json())
+            resolved_message = client.post(
+                f'/api/human-conversations/{conversation["id"]}/messages',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'content': 'I have another question.'},
+            )
+            assert resolved_message.status_code == 409
             reopened = client.patch(
                 f'/api/tickets/{ticket["id"]}',
                 headers={'Authorization': f'Bearer {doctor_token}'},
@@ -267,9 +330,26 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
             assert company_b_start.status_code == 200, company_b_start.text
             company_b_ticket = company_b_start.json()['ticket']
             assert company_b_start.json()['company_id'] == 102
-            assert company_b_ticket['sales_representative_id'] == 7
+            assert company_b_ticket['sales_representative_id'] is None
             assert {item['ticket_no'] for item in client.get('/api/tickets', headers={'Authorization': f'Bearer {company_a_token}'}).json()} == {ticket['ticket_no']}
             assert {item['ticket_no'] for item in client.get('/api/tickets', headers={'Authorization': f'Bearer {company_b_token}'}).json()} == {company_b_ticket['ticket_no']}
+            company_b_claim = client.post(f'/api/human-conversations/{company_b_start.json()["id"]}/claim', headers={'Authorization': f'Bearer {rep_b_token}'})
+            assert company_b_claim.status_code == 200, company_b_claim.text
+            company_b_resolution = client.patch(
+                f'/api/tickets/{company_b_ticket["id"]}',
+                headers={'Authorization': f'Bearer {rep_b_token}'},
+                json={'status': 'Resolved'},
+            )
+            assert company_b_resolution.json()['ticket']['status'] == 'Pending Confirmation'
+            doctor_rejected = client.patch(
+                f'/api/tickets/{company_b_ticket["id"]}',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'resolution_confirmation': 'no'},
+            )
+            assert doctor_rejected.status_code == 200, doctor_rejected.text
+            assert doctor_rejected.json()['ticket']['status'] == 'Pending'
+            assert doctor_rejected.json()['ticket']['doctor_resolution'] == 'no'
+            assert client.get('/api/notifications', headers={'Authorization': f'Bearer {rep_b_token}'}).json()[0]['title'] == 'Doctor still needs help'
 
             denied = client.get(
                 f'/api/human-conversations/{conversation["id"]}',
@@ -305,7 +385,7 @@ def test_company_without_eligible_rep_opens_company_owned_waiting_conversation()
             conversation = response.json()
             assert conversation['id'] == 3
             assert conversation['sales_representative_id'] is None
-            assert conversation['ticket_status'] == 'Waiting for Company'
+            assert conversation['ticket_status'] == 'Open'
 
             repeated = client.post(
                 '/api/conversations',
@@ -328,7 +408,7 @@ def test_company_without_eligible_rep_opens_company_owned_waiting_conversation()
                 headers={'Authorization': f'Bearer {company_c_token}'},
             )
             assert company_detail.status_code == 200, company_detail.text
-            assert company_detail.json()['ticket']['status'] == 'Waiting for Company'
+            assert company_detail.json()['ticket']['status'] == 'Open'
             assert company_detail.json()['messages'][0]['content'] == 'Please route my request to company support.'
             reply = client.post(
                 f'/api/human-conversations/{conversation["id"]}/messages',
@@ -343,6 +423,153 @@ def test_company_without_eligible_rep_opens_company_owned_waiting_conversation()
             assert doctor_detail.json()['messages'][-1]['content'] == 'A company support colleague will take this conversation.'
             chats = client.get('/api/human-conversations', headers={'Authorization': f'Bearer {doctor_token}'}).json()
             assert {chat['id'] for chat in chats} == {1, 2, 3}
+    finally:
+        cleanup_temp_db(db_path)
+
+
+def test_ai_escalation_reuses_ticket_and_converts_the_owned_ai_thread():
+    db_path = setup_temp_db()
+    try:
+        seed_company_chat_data(db_path)
+        issue = 'I have an allergic reaction and need help.'
+        with sqlite3.connect(db_path) as conn:
+            agent_id = conn.execute(
+                "INSERT INTO conversations(user_id,role,conversation_type,created_at) VALUES(?,?,?,?)",
+                (2, 'doctor', 'agent', main.now()),
+            ).lastrowid
+            conn.execute(
+                'INSERT INTO messages(conversation_id,sender,agent,content,risk,created_at) VALUES(?,?,?,?,?,?)',
+                (agent_id, 'user', '', issue, '', main.now()),
+            )
+            conn.execute(
+                'INSERT INTO messages(conversation_id,sender,agent,content,risk,created_at) VALUES(?,?,?,?,?,?)',
+                (agent_id, 'agent', 'Risk & Escalation Agent', 'This needs qualified human review.', 'critical', main.now()),
+            )
+            conn.execute(
+                'INSERT INTO medicines(name,category,price,description,stock,status,created_at,owner_user_id,company) VALUES(?,?,?,?,?,?,?,?,?)',
+                ('Company A Product', 'General', 100, 'Test product', 10, 'Active', main.now(), 101, 'Company A'),
+            )
+            conn.execute(
+                'INSERT INTO medicines(name,category,price,description,stock,status,created_at,owner_user_id,company) VALUES(?,?,?,?,?,?,?,?,?)',
+                ('Company B Product', 'General', 100, 'Test product', 10, 'Active', main.now(), 102, 'Company B'),
+            )
+            conn.commit()
+        c = main.db()
+        doctor = main.row(c.execute('SELECT * FROM users WHERE id=2').fetchone())
+        c.close()
+        ai_escalation = main.agent_answer(doctor, issue)
+        assert ai_escalation['risk'] == 'critical'
+        doctor_token = main.token({'id': 2, 'role': 'doctor'})
+        headers = {'Authorization': f'Bearer {doctor_token}'}
+        with TestClient(main.app) as client:
+            handoff = client.post('/api/ai/human-handoff', headers=headers, json={'message': issue, 'conversation_id': agent_id})
+            assert handoff.status_code == 200, handoff.text
+            started = client.post(
+                '/api/conversations',
+                headers=headers,
+                json={'company_id': 3, 'medicine_id': 1, 'issue': issue, 'agent_conversation_id': agent_id},
+            )
+            assert started.status_code == 200, started.text
+            conversation = started.json()
+            assert conversation['id'] == agent_id
+            assert conversation['conversation_type'] == 'human'
+            assert conversation['doctor_id'] == 2
+            assert conversation['company_id'] == 101
+            assert conversation['medicine_id'] == 1
+            assert conversation['ticket']['priority'] == 'Critical'
+            assert conversation['ticket']['content'] == issue
+            detail = client.get(f'/api/human-conversations/{agent_id}', headers=headers)
+            assert detail.status_code == 200, detail.text
+            assert len(detail.json()['messages']) == 2
+            reopened = client.post('/api/conversations', headers=headers, json={'company_id': 3, 'medicine_id': 1})
+            assert reopened.status_code == 200, reopened.text
+            assert reopened.json()['id'] == agent_id
+            second_issue = 'I have a severe side effect and need human help again.'
+            with sqlite3.connect(db_path) as conn:
+                second_agent_id = conn.execute(
+                    "INSERT INTO conversations(user_id,role,conversation_type,created_at) VALUES(?,?,?,?)",
+                    (2, 'doctor', 'agent', main.now()),
+                ).lastrowid
+                conn.execute(
+                    'INSERT INTO messages(conversation_id,sender,agent,content,risk,created_at) VALUES(?,?,?,?,?,?)',
+                    (second_agent_id, 'user', '', second_issue, '', main.now()),
+                )
+                conn.execute(
+                    'INSERT INTO messages(conversation_id,sender,agent,content,risk,created_at) VALUES(?,?,?,?,?,?)',
+                    (second_agent_id, 'agent', 'Risk & Escalation Agent', 'This needs qualified human review.', 'critical', main.now()),
+                )
+                conn.commit()
+            main.agent_answer(doctor, second_issue)
+            second_escalation = client.post(
+                '/api/conversations',
+                headers=headers,
+                json={'company_id': 3, 'medicine_id': 1, 'issue': second_issue, 'agent_conversation_id': second_agent_id},
+            )
+            assert second_escalation.status_code == 200, second_escalation.text
+            assert second_escalation.json()['id'] == agent_id
+            assert second_escalation.json()['ticket_id'] == conversation['ticket']['id']
+            assert second_escalation.json()['ticket']['priority'] == 'Critical'
+            assert second_issue in second_escalation.json()['ticket']['content']
+            imported_detail = client.get(f'/api/human-conversations/{agent_id}', headers=headers)
+            assert any(message['content'] == second_issue for message in imported_detail.json()['messages'])
+            with sqlite3.connect(db_path) as conn:
+                imported_count = conn.execute('SELECT COUNT(*) FROM messages WHERE conversation_id=? AND source_message_id IS NOT NULL', (agent_id,)).fetchone()[0]
+            assert imported_count == 2
+            repeated_import = client.post(
+                '/api/conversations',
+                headers=headers,
+                json={'company_id': 3, 'medicine_id': 1, 'issue': second_issue, 'agent_conversation_id': second_agent_id},
+            )
+            assert repeated_import.status_code == 200, repeated_import.text
+            with sqlite3.connect(db_path) as conn:
+                assert conn.execute('SELECT COUNT(*) FROM messages WHERE conversation_id=? AND source_message_id IS NOT NULL', (agent_id,)).fetchone()[0] == imported_count
+            invalid_medicine = client.post('/api/conversations', headers=headers, json={'company_id': 3, 'medicine_id': 2})
+            assert invalid_medicine.status_code == 400
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM tickets WHERE conversation_id=?', (agent_id,)).fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM tickets WHERE status='Closed' AND subject LIKE 'Merged into %'").fetchone()[0] == 1
+    finally:
+        cleanup_temp_db(db_path)
+
+
+def test_simultaneous_representative_claims_have_one_winner():
+    db_path = setup_temp_db()
+    try:
+        seed_company_chat_data(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute('UPDATE conversations SET sales_rep_id=NULL,sales_representative_id=NULL,assigned_at=NULL WHERE id=1')
+            conn.execute(
+                "INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id) VALUES(?,?,?,?,?,?,?,?)",
+                ('Rep A2', 'rep.a2@race.test', main.phash('secret'), 'sales_rep', 'Company A', main.now(), 'approved', 101),
+            )
+            conn.commit()
+        doctor_token = main.token({'id': 1, 'role': 'doctor'})
+        with TestClient(main.app) as client:
+            started = client.post('/api/conversations', headers={'Authorization': f'Bearer {doctor_token}'}, json={'company_id': 3})
+            assert started.status_code == 200, started.text
+            conversation_id = started.json()['id']
+        tokens = [
+            main.token({'id': 6, 'role': 'sales_rep', 'company_user_id': 101}),
+            main.token({'id': 9, 'role': 'sales_rep', 'company_user_id': 101}),
+        ]
+
+        def claim(token):
+            try:
+                main.claim_human_conversation(conversation_id, f'Bearer {token}')
+                return 200
+            except main.HTTPException as exc:
+                return exc.status_code
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            statuses = list(executor.map(claim, tokens))
+        assert sorted(statuses) == [200, 409]
+        c = main.db()
+        conversation = c.execute('SELECT * FROM conversations WHERE id=?', (conversation_id,)).fetchone()
+        ticket = c.execute('SELECT * FROM tickets WHERE conversation_id=?', (conversation_id,)).fetchone()
+        c.close()
+        assert conversation['sales_representative_id'] in (6, 9)
+        assert ticket['sales_representative_id'] == conversation['sales_representative_id']
+        assert ticket['status'] == 'Assigned'
     finally:
         cleanup_temp_db(db_path)
 

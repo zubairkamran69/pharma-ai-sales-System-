@@ -273,29 +273,29 @@ def test_private_human_chats_are_company_scoped_and_hidden_from_admin():
     db_path = setup_temp_db()
     try:
         with sqlite3.connect(db_path) as conn:
-            conn.execute(
+            company_a_id = conn.execute(
                 'INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id,job_title) VALUES (?,?,?,?,?,?,?,?,?)',
                 ('Zenora Pharma', 'zenora@demo.local', main.phash('zenora123'), 'pharma', 'Zenora Pharma', main.now(), 'approved', 0, 'Commercial Lead')
-            )
+            ).lastrowid
             conn.execute(
                 'INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id,job_title) VALUES (?,?,?,?,?,?,?,?,?)',
-                ('Abeel Rep', 'abeel@demo.local', main.phash('abeel123'), 'sales_rep', 'Zenora Pharma', main.now(), 'approved', 1, 'Regional Sales Rep')
+                ('Abeel Rep', 'abeel@demo.local', main.phash('abeel123'), 'sales_rep', 'Zenora Pharma', main.now(), 'approved', company_a_id, 'Regional Sales Rep')
             )
-            conn.execute(
+            company_b_id = conn.execute(
                 'INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id,job_title) VALUES (?,?,?,?,?,?,?,?,?)',
                 ('NovaPeak Pharma', 'novapeak@demo.local', main.phash('novapeak123'), 'pharma', 'NovaPeak Pharma', main.now(), 'approved', 0, 'Commercial Lead')
-            )
+            ).lastrowid
             conn.execute(
                 'INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id,job_title) VALUES (?,?,?,?,?,?,?,?,?)',
-                ('Raza Rep', 'raza@demo.local', main.phash('raza123'), 'sales_rep', 'NovaPeak Pharma', main.now(), 'approved', 3, 'Account Manager')
+                ('Raza Rep', 'raza@demo.local', main.phash('raza123'), 'sales_rep', 'NovaPeak Pharma', main.now(), 'approved', company_b_id, 'Account Manager')
             )
             conn.execute(
                 'INSERT INTO medicines(name, category, price, description, stock, status, created_at, owner_user_id, company) VALUES (?,?,?,?,?,?,?, ?,?)',
-                ('Zenora Cardio Plus', 'Cardiovascular', 250.0, 'Company A medicine used for access tests', 25, 'Active', main.now(), 1, 'Zenora Pharma')
+                ('Zenora Cardio Plus', 'Cardiovascular', 250.0, 'Company A medicine used for access tests', 25, 'Active', main.now(), company_a_id, 'Zenora Pharma')
             )
             conn.execute(
                 'INSERT INTO medicines(name, category, price, description, stock, status, created_at, owner_user_id, company) VALUES (?,?,?,?,?,?,?, ?,?)',
-                ('NovaPeak Cardio Prime', 'Cardiovascular', 300.0, 'Company B medicine used for access tests', 12, 'Active', main.now(), 3, 'NovaPeak Pharma')
+                ('NovaPeak Cardio Prime', 'Cardiovascular', 300.0, 'Company B medicine used for access tests', 12, 'Active', main.now(), company_b_id, 'NovaPeak Pharma')
             )
             conn.commit()
 
@@ -334,25 +334,25 @@ def test_company_isolated_human_chats_reject_cross_company_access():
     db_path = setup_temp_db()
     try:
         with sqlite3.connect(db_path) as conn:
-            conn.execute(
+            company_a_id = conn.execute(
                 'INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id,job_title) VALUES (?,?,?,?,?,?,?,?,?)',
                 ('Alpha Pharma', 'alpha@demo.local', main.phash('alpha123'), 'pharma', 'Alpha Pharma', main.now(), 'approved', 0, 'Commercial Lead')
-            )
+            ).lastrowid
             conn.execute(
                 'INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id,job_title) VALUES (?,?,?,?,?,?,?,?,?)',
-                ('Alpha Rep', 'alpha.rep@demo.local', main.phash('alphaRep123'), 'sales_rep', 'Alpha Pharma', main.now(), 'approved', 1, 'Representative')
+                ('Alpha Rep', 'alpha.rep@demo.local', main.phash('alphaRep123'), 'sales_rep', 'Alpha Pharma', main.now(), 'approved', company_a_id, 'Representative')
             )
-            conn.execute(
+            company_b_id = conn.execute(
                 'INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id,job_title) VALUES (?,?,?,?,?,?,?,?,?)',
                 ('Beta Pharma', 'beta@demo.local', main.phash('beta123'), 'pharma', 'Beta Pharma', main.now(), 'approved', 0, 'Commercial Lead')
-            )
+            ).lastrowid
             conn.execute(
                 'INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id,job_title) VALUES (?,?,?,?,?,?,?,?,?)',
-                ('Beta Rep', 'beta.rep@demo.local', main.phash('betaRep123'), 'sales_rep', 'Beta Pharma', main.now(), 'approved', 3, 'Representative')
+                ('Beta Rep', 'beta.rep@demo.local', main.phash('betaRep123'), 'sales_rep', 'Beta Pharma', main.now(), 'approved', company_b_id, 'Representative')
             )
             conn.execute(
                 'INSERT INTO medicines(name, category, price, description, stock, status, created_at, owner_user_id, company) VALUES (?,?,?,?,?,?,?, ?,?)',
-                ('Alpha Cardio', 'Cardiovascular', 220.0, 'Alpha medicine for isolation test', 30, 'Active', main.now(), 1, 'Alpha Pharma')
+                ('Alpha Cardio', 'Cardiovascular', 220.0, 'Alpha medicine for isolation test', 30, 'Active', main.now(), company_a_id, 'Alpha Pharma')
             )
             conn.commit()
 
