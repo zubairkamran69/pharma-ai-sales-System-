@@ -374,13 +374,32 @@ def init():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ticket_no TEXT UNIQUE,
       user_id INTEGER,
+            doctor_id INTEGER,
+            company_id INTEGER,
+            sales_representative_id INTEGER,
+            conversation_id INTEGER,
+            medicine_id INTEGER,
       subject TEXT,
       content TEXT,
       priority TEXT,
       department TEXT,
       status TEXT,
       created_at TEXT,
-      updated_at TEXT
+            updated_at TEXT,
+            resolved_at TEXT,
+            closed_at TEXT,
+            resolved_by INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS ticket_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL,
+            actor_id INTEGER,
+            actor_role TEXT,
+            event_type TEXT NOT NULL,
+            old_status TEXT,
+            new_status TEXT,
+            created_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS notifications(
@@ -504,6 +523,22 @@ def init():
        "ALTER TABLE conversations ADD COLUMN assigned_at TEXT"),
       ('conversations','closed_at',
        "ALTER TABLE conversations ADD COLUMN closed_at TEXT"),
+    ('tickets','doctor_id',
+     "ALTER TABLE tickets ADD COLUMN doctor_id INTEGER"),
+    ('tickets','company_id',
+     "ALTER TABLE tickets ADD COLUMN company_id INTEGER"),
+    ('tickets','sales_representative_id',
+     "ALTER TABLE tickets ADD COLUMN sales_representative_id INTEGER"),
+    ('tickets','conversation_id',
+     "ALTER TABLE tickets ADD COLUMN conversation_id INTEGER"),
+    ('tickets','medicine_id',
+     "ALTER TABLE tickets ADD COLUMN medicine_id INTEGER"),
+    ('tickets','resolved_at',
+     "ALTER TABLE tickets ADD COLUMN resolved_at TEXT"),
+    ('tickets','closed_at',
+     "ALTER TABLE tickets ADD COLUMN closed_at TEXT"),
+    ('tickets','resolved_by',
+     "ALTER TABLE tickets ADD COLUMN resolved_by INTEGER"),
       ('messages','sender_id',
        "ALTER TABLE messages ADD COLUMN sender_id INTEGER"),
       ('messages','sender_role',
@@ -557,6 +592,18 @@ def init():
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_sales_id ON users(sales_id)')
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_order_number ON orders(order_number)')
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_order_no ON orders(order_no)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_conversations_doctor_id ON conversations(doctor_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_conversations_company_id ON conversations(company_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_conversations_rep_id ON conversations(sales_representative_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tickets_doctor_id ON tickets(doctor_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tickets_company_id ON tickets(company_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tickets_rep_id ON tickets(sales_representative_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tickets_conversation_id ON tickets(conversation_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)')
+    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_conversation_unique ON tickets(conversation_id) WHERE conversation_id IS NOT NULL')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_ticket_events_ticket_id ON ticket_events(ticket_id)')
     c.execute('CREATE TABLE IF NOT EXISTS order_events(\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      order_id INTEGER,\n      timestamp TEXT,\n      actor TEXT,\n      role TEXT,\n      old_status TEXT,\n      new_status TEXT,\n      note TEXT\n    )')
 
     c.execute(
@@ -654,7 +701,7 @@ def human_conversation_allowed(u, conv):
             return False
         if target_company in company_values:
             rep_id = resolve_representative_id(conv_data)
-            return rep_id is None or rep_id == u['id']
+            return rep_id == u['id']
         return False
     return False
 
@@ -964,7 +1011,7 @@ def health():
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(503, 'Database health check failed.') from exc
-    required = {'users', 'medicines', 'documents', 'knowledge_chunks', 'conversations', 'messages', 'orders', 'notifications'}
+    required = {'users', 'medicines', 'documents', 'knowledge_chunks', 'conversations', 'messages', 'orders', 'tickets', 'ticket_events', 'notifications'}
     missing = sorted(required - tables)
     return {
         'status': 'healthy' if not missing else 'degraded',
@@ -2843,7 +2890,7 @@ def _select_company_rep_for_chat(c, company_user_id: int | None, preferred_medic
         FROM users u
         WHERE u.role='sales_rep'
           AND u.company_user_id=?
-          AND u.verification_status IN ('approved','demo')
+          AND u.verification_status IN ('approved','verified','demo')
         ORDER BY assigned_count ASC, u.id ASC
         LIMIT 1
         """,
@@ -2852,6 +2899,54 @@ def _select_company_rep_for_chat(c, company_user_id: int | None, preferred_medic
     if not rows:
         return None
     return row(rows[0])
+
+
+def _create_human_ticket(c, doctor, company_id, company_name, representative_id, conversation_id, medicine_id):
+    existing = c.execute('SELECT * FROM tickets WHERE conversation_id=? ORDER BY id DESC LIMIT 1', (conversation_id,)).fetchone()
+    if existing:
+        return row(existing), False
+
+    created_at = now()
+    subject = f'Sales support request: {company_name}'
+    content = f'{doctor["name"]} started a human support conversation with {company_name}.'
+    ticket_id = c.execute(
+        '''INSERT INTO tickets(
+             user_id,doctor_id,company_id,sales_representative_id,conversation_id,medicine_id,
+             subject,content,priority,department,status,created_at,updated_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+        (doctor['id'], doctor['id'], company_id, representative_id, conversation_id, medicine_id,
+         subject, content, 'Normal', 'Company Sales Support', 'Open', created_at, created_at),
+    ).lastrowid
+    ticket_no = f'TKT-{2000 + int(ticket_id)}'
+    suffix = 1
+    while c.execute('SELECT id FROM tickets WHERE ticket_no=? AND id<>?', (ticket_no, ticket_id)).fetchone():
+        suffix += 1
+        ticket_no = f'TKT-{2000 + int(ticket_id)}-{suffix}'
+    c.execute('UPDATE tickets SET ticket_no=? WHERE id=?', (ticket_no, ticket_id))
+    c.execute(
+        'INSERT INTO ticket_events(ticket_id,actor_id,actor_role,event_type,new_status,created_at) VALUES(?,?,?,?,?,?)',
+        (ticket_id, doctor['id'], 'doctor', 'created', 'Open', created_at),
+    )
+    c.execute(
+        'INSERT INTO ticket_events(ticket_id,actor_id,actor_role,event_type,created_at) VALUES(?,?,?,?,?)',
+        (ticket_id, representative_id, 'sales_rep', 'assigned', created_at),
+    )
+    return row(c.execute('SELECT * FROM tickets WHERE id=?', (ticket_id,)).fetchone()), True
+
+
+def _human_participant_ids(c, conversation):
+    conv = dict(conversation) if hasattr(conversation, 'keys') else conversation or {}
+    participant_ids = {conv.get('doctor_id'), resolve_representative_id(conv)}
+    company_id = resolve_conversation_company(conv)
+    if company_id is not None:
+        participant_ids.update(
+            item['id'] for item in c.execute(
+                "SELECT id FROM users WHERE role='pharma' AND (id=? OR company_user_id=?)",
+                (company_id, company_id),
+            ).fetchall()
+        )
+    participant_ids.discard(None)
+    return participant_ids
 
 
 @app.get('/api/doctor/pharma-companies')
@@ -2866,16 +2961,27 @@ def doctor_pharma_companies(authorization: str | None = Header(default=None)):
                COALESCE(u.address, '') AS location,
                u.phone AS support_phone,
                (SELECT COUNT(*) FROM medicines m WHERE m.owner_user_id=u.id) AS products_count,
-               (SELECT COUNT(*) FROM users rep WHERE rep.role='sales_rep' AND rep.company_user_id=u.id AND rep.verification_status IN ('approved','demo')) AS reps_count,
-               (SELECT COUNT(*) FROM users rep WHERE rep.role='sales_rep' AND rep.company_user_id=u.id AND rep.verification_status IN ('approved','demo')) > 0 AS available_contact
+               (SELECT COUNT(*) FROM users rep WHERE rep.role='sales_rep' AND rep.company_user_id=u.id AND rep.verification_status IN ('approved','verified','demo')) AS reps_count,
+               (SELECT COUNT(*) FROM users rep WHERE rep.role='sales_rep' AND rep.company_user_id=u.id AND rep.verification_status IN ('approved','verified','demo')) > 0 AS available_contact
         FROM users u
         WHERE u.role='pharma'
-          AND u.verification_status IN ('approved','demo')
+          AND u.verification_status IN ('approved','verified','demo')
         ORDER BY u.name ASC
     """
     companies = rows(c.execute(q))
     c.close()
     return companies
+
+
+@app.post('/api/ai/human-handoff')
+def start_ai_human_handoff(authorization: str | None = Header(default=None)):
+    guard('doctor')(authorization)
+    companies = doctor_pharma_companies(authorization)
+    return {
+        'status': 'company_selection',
+        'message': 'Choose a pharmaceutical company to start a human sales conversation.',
+        'companies': companies,
+    }
 
 
 @app.get('/api/pharma-companies/{company_id}')
@@ -2920,7 +3026,7 @@ def create_or_get_conversation(payload: dict | None = Body(default=None), author
     if not company_id:
         raise HTTPException(400, 'company_id is required')
     c = db()
-    company = c.execute("SELECT * FROM users WHERE role='pharma' AND (id=? OR company_user_id=?) AND verification_status IN ('approved','demo')", (company_id, company_id)).fetchone()
+    company = c.execute("SELECT * FROM users WHERE role='pharma' AND (id=? OR company_user_id=?) AND verification_status IN ('approved','verified','demo')", (company_id, company_id)).fetchone()
     if not company:
         c.close(); raise HTTPException(404, 'Company not found or unavailable for chat')
     company_row = row(company)
@@ -2940,6 +3046,7 @@ def create_or_get_conversation(payload: dict | None = Body(default=None), author
         """,
         (u['id'], company_scope_id, medicine_id),
     ).fetchone()
+    conversation_created = not bool(existing)
     if existing:
         cid = existing['id']
     else:
@@ -2955,11 +3062,33 @@ def create_or_get_conversation(payload: dict | None = Body(default=None), author
             (u['id'], 'doctor', 'human', u['id'], company_scope_id, company_scope_id, rep['id'], rep['id'], medicine_id, 'open', conv_ts, conv_ts, conv_ts, conv_ts),
         ).lastrowid
     c.execute('UPDATE conversations SET company_id=COALESCE(company_id, company_user_id), sales_representative_id=COALESCE(sales_representative_id, sales_rep_id), status=COALESCE(status, "open"), updated_at=?, last_message_at=COALESCE(last_message_at, ?) WHERE id=?', (now(), now(), cid))
-    c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)', (rep['id'], 'New Doctor Conversation', f'{u["name"]} has started a conversation regarding your company.', 'human_chat', now()))
-    c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)', (company_scope_id, 'Doctor Conversation Started', f'{u["name"]} opened a live conversation with your company.', 'human_chat', now()))
+    conv_row = c.execute('SELECT * FROM conversations WHERE id=?', (cid,)).fetchone()
+    assigned_rep_id = resolve_representative_id(conv_row)
+    eligible_assignment = c.execute("SELECT id FROM users WHERE id=? AND role='sales_rep' AND company_user_id=? AND verification_status IN ('approved','verified','demo')",(assigned_rep_id,company_scope_id)).fetchone()
+    if not eligible_assignment:
+        assigned_rep_id = rep['id']
+        c.execute('UPDATE conversations SET sales_representative_id=?,sales_rep_id=?,assigned_at=? WHERE id=?',(assigned_rep_id,assigned_rep_id,now(),cid))
+    ticket, ticket_created = _create_human_ticket(
+        c, u, company_scope_id, company_row.get('company') or company_row.get('name') or 'pharma company',
+        assigned_rep_id, cid, medicine_id,
+    )
+    if ticket['sales_representative_id'] != assigned_rep_id:
+        timestamp=now()
+        c.execute('UPDATE tickets SET sales_representative_id=?,updated_at=? WHERE id=?',(assigned_rep_id,timestamp,ticket['id']))
+        c.execute('INSERT INTO ticket_events(ticket_id,actor_id,actor_role,event_type,created_at) VALUES(?,?,?,?,?)',(ticket['id'],u['id'],'system','assigned',timestamp))
+        ticket=row(c.execute('SELECT * FROM tickets WHERE id=?',(ticket['id'],)).fetchone())
+    if conversation_created or ticket_created:
+        notice = f'{u["name"]} started a company support conversation. Ticket: {ticket["ticket_no"]}.'
+        c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)', (assigned_rep_id, 'New Doctor Support Request', notice, 'human_chat', now()))
+        c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)', (company_row['id'], 'New Doctor Support Request', notice, 'human_chat', now()))
     c.commit();
     conv_row = c.execute('SELECT * FROM conversations WHERE id=?', (cid,)).fetchone()
-    c.close(); return row(conv_row)
+    result = row(conv_row)
+    result['ticket'] = ticket
+    result['ticket_id'] = ticket['id']
+    result['ticket_no'] = ticket['ticket_no']
+    result['ticket_status'] = ticket['status']
+    c.close(); return result
 
 
 @app.get('/api/conversations')
@@ -2995,7 +3124,6 @@ def list_conversations(authorization: str | None = Header(default=None)):
         """
         params = (company_id,)
     elif u['role'] == 'sales_rep':
-        company_id = owner_company_id(u)
         q = """
             SELECT c.*, m.name AS medicine, du.name AS doctor_name, sr.name AS representative_name
             FROM conversations c
@@ -3003,10 +3131,10 @@ def list_conversations(authorization: str | None = Header(default=None)):
             LEFT JOIN users du ON du.id = c.doctor_id
             LEFT JOIN users sr ON sr.id = COALESCE(c.sales_representative_id, c.sales_rep_id)
             WHERE c.conversation_type='human'
-              AND (COALESCE(c.company_id, c.company_user_id)=? OR COALESCE(c.sales_representative_id, c.sales_rep_id)=?)
+              AND COALESCE(c.sales_representative_id, c.sales_rep_id)=?
             ORDER BY c.id DESC
         """
-        params = (company_id, u['id'])
+        params = (u['id'],)
     else:
         c.close(); raise HTTPException(403, 'Permission denied')
     conversations = rows(c.execute(q, params))
@@ -3073,18 +3201,29 @@ def update_conversation(conversation_id: int, payload: dict | None = Body(defaul
     if not human_conversation_allowed(u, conv_row):
         c.close(); raise HTTPException(403, 'Conversation access denied')
     if 'status' in data:
-        new_status = str(data['status']).strip() or 'open'
-        c.execute('UPDATE conversations SET status=?, updated_at=?, closed_at=? WHERE id=?', (new_status, now(), (None if new_status not in ('closed','resolved','rejected') else now()), conversation_id))
+        c.close(); raise HTTPException(400, 'Update the linked support ticket status instead')
     if 'sales_representative_id' in data:
+        if u['role'] != 'pharma':
+            c.close(); raise HTTPException(403, 'Only the owning company can assign a representative')
         rep_id = data['sales_representative_id']
-        c.execute('UPDATE conversations SET sales_representative_id=?, sales_rep_id=?, assigned_at=?, updated_at=? WHERE id=?', (rep_id, rep_id, now(), now(), conversation_id))
+        company_id=resolve_conversation_company(conv_row)
+        representative=c.execute("SELECT id FROM users WHERE id=? AND role='sales_rep' AND company_user_id=? AND verification_status IN ('approved','verified','demo')",(rep_id,company_id)).fetchone()
+        if not representative:
+            c.close(); raise HTTPException(400,'Select an eligible representative from your company')
+        assigned_at=now()
+        c.execute('UPDATE conversations SET sales_representative_id=?, sales_rep_id=?, assigned_at=?, updated_at=? WHERE id=?', (rep_id, rep_id, assigned_at, assigned_at, conversation_id))
+        ticket=c.execute('SELECT * FROM tickets WHERE conversation_id=?',(conversation_id,)).fetchone()
+        if ticket:
+            c.execute('UPDATE tickets SET sales_representative_id=?,updated_at=? WHERE id=?',(rep_id,assigned_at,ticket['id']))
+            c.execute('INSERT INTO ticket_events(ticket_id,actor_id,actor_role,event_type,created_at) VALUES(?,?,?,?,?)',(ticket['id'],u['id'],u['role'],'assigned',assigned_at))
+            c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)',(rep_id,'Doctor Support Ticket Assigned',f'Ticket {ticket["ticket_no"]} is assigned to you.','human_ticket',assigned_at))
     c.commit(); updated = c.execute('SELECT * FROM conversations WHERE id=?', (conversation_id,)).fetchone(); c.close(); return row(updated)
 
 
 @app.post('/api/conversations/{conversation_id}/assign')
 def assign_conversation_rep(conversation_id: int, payload: dict | None = Body(default=None), authorization: str | None = Header(default=None)):
     u = auth(authorization)
-    if u['role'] not in ('pharma', 'sales_rep'):
+    if u['role'] != 'pharma':
         raise HTTPException(403, 'Only the company workspace can reassign a representative')
     data = dict(payload or {})
     rep_id = data.get('sales_representative_id') or data.get('rep_id')
@@ -3094,9 +3233,22 @@ def assign_conversation_rep(conversation_id: int, payload: dict | None = Body(de
     if not conv:
         c.close(); raise HTTPException(404, 'Conversation not found')
     conv_row = row(conv)
-    if owner_company_id(u) != (conv_row.get('company_id') or conv_row.get('company_user_id')):
+    conversation_company_id = resolve_conversation_company(conv_row)
+    if owner_company_id(u) != conversation_company_id:
         c.close(); raise HTTPException(403, 'Access denied')
+    rep = c.execute(
+        "SELECT id FROM users WHERE id=? AND role='sales_rep' AND company_user_id=? AND verification_status IN ('approved','verified','demo')",
+        (rep_id, conversation_company_id),
+    ).fetchone()
+    if not rep:
+        c.close(); raise HTTPException(400, 'Select an eligible representative from your company')
     c.execute('UPDATE conversations SET sales_representative_id=?, sales_rep_id=?, assigned_at=?, updated_at=? WHERE id=?', (rep_id, rep_id, now(), now(), conversation_id))
+    ticket=c.execute('SELECT * FROM tickets WHERE conversation_id=?',(conversation_id,)).fetchone()
+    if ticket:
+        timestamp=now()
+        c.execute('UPDATE tickets SET sales_representative_id=?,updated_at=? WHERE id=?',(rep_id,timestamp,ticket['id']))
+        c.execute('INSERT INTO ticket_events(ticket_id,actor_id,actor_role,event_type,created_at) VALUES(?,?,?,?,?)',(ticket['id'],u['id'],u['role'],'assigned',timestamp))
+        c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)',(rep_id,'Doctor Support Ticket Assigned',f'Ticket {ticket["ticket_no"]} is assigned to you.','human_ticket',timestamp))
     c.commit(); updated = c.execute('SELECT * FROM conversations WHERE id=?', (conversation_id,)).fetchone(); c.close(); return row(updated)
 
 
@@ -3121,22 +3273,53 @@ def contact_rep(medicine_id:int,authorization: str|None=Header(default=None)):
     rep=_select_company_rep_for_chat(c, m['owner_user_id'])
     if not rep: c.close(); raise HTTPException(404,'No verified sales representative is available for this company')
     existing=c.execute("select id from conversations where conversation_type='human' and doctor_id=? and company_id=? and medicine_id=? order by id desc limit 1",(u['id'],m['owner_user_id'],medicine_id)).fetchone()
+    conversation_created = not bool(existing)
     if existing: cid=existing['id']
-    else: cid=c.execute('insert into conversations(user_id,role,conversation_type,doctor_id,sales_rep_id,medicine_id,company_user_id,company_id,sales_representative_id,status,created_at,updated_at,last_message_at,assigned_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(u['id'],'doctor','human',u['id'],rep['id'],medicine_id,m['owner_user_id'],m['owner_user_id'],rep['id'],'open',now(),now(),now(),now())).lastrowid
+    else: cid=c.execute('insert into conversations(user_id,role,conversation_type,doctor_id,sales_rep_id,medicine_id,company_user_id,company_id,sales_representative_id,status,created_at,updated_at,last_message_at,assigned_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(u['id'],'doctor','human',u['id'],rep['id'],medicine_id,m['owner_user_id'],m['owner_user_id'],rep['id'],'open',now(),now(),now(),now())).lastrowid
     c.execute('update conversations set company_id=COALESCE(company_id, company_user_id), sales_representative_id=COALESCE(sales_representative_id, sales_rep_id) where id=?',(cid,))
-    c.execute('insert into notifications(user_id,title,body,type,created_at) values(?,?,?,?,?)',(rep['id'],'Doctor requested human chat',f'{u["name"]} wants to speak about {m["name"]}.','human_chat',now())); c.commit(); out={'conversation_id':cid,'medicine':m['name'],'company':m['company'],'representative':{k:rep[k] for k in ['id','name','email','phone','job_title']}}; c.close(); return out
+    conv=c.execute('SELECT * FROM conversations WHERE id=?',(cid,)).fetchone()
+    assigned_rep_id=resolve_representative_id(conv)
+    eligible_assignment=c.execute("SELECT id FROM users WHERE id=? AND role='sales_rep' AND company_user_id=? AND verification_status IN ('approved','verified','demo')",(assigned_rep_id,m['owner_user_id'])).fetchone()
+    if not eligible_assignment:
+        assigned_rep_id=rep['id']
+        c.execute('UPDATE conversations SET sales_representative_id=?,sales_rep_id=?,assigned_at=? WHERE id=?',(assigned_rep_id,assigned_rep_id,now(),cid))
+    assigned_rep=row(c.execute('SELECT * FROM users WHERE id=?',(assigned_rep_id,)).fetchone())
+    company=c.execute("SELECT * FROM users WHERE role='pharma' AND (id=? OR company_user_id=?) ORDER BY id LIMIT 1",(m['owner_user_id'],m['owner_user_id'])).fetchone()
+    company_row=row(company) if company else {'id':m['owner_user_id'],'company':m['company']}
+    ticket,ticket_created=_create_human_ticket(c,u,m['owner_user_id'],company_row.get('company') or company_row.get('name') or m['company'],assigned_rep_id,cid,medicine_id)
+    if ticket['sales_representative_id'] != assigned_rep_id:
+        c.execute('UPDATE tickets SET sales_representative_id=?,updated_at=? WHERE id=?',(assigned_rep_id,now(),ticket['id']))
+        ticket=row(c.execute('SELECT * FROM tickets WHERE id=?',(ticket['id'],)).fetchone())
+    if conversation_created or ticket_created:
+        notice=f'{u["name"]} requested help with {m["name"]}. Ticket: {ticket["ticket_no"]}.'
+        c.execute('insert into notifications(user_id,title,body,type,created_at) values(?,?,?,?,?)',(assigned_rep_id,'New Doctor Support Request',notice,'human_chat',now()))
+        c.execute('insert into notifications(user_id,title,body,type,created_at) values(?,?,?,?,?)',(company_row['id'],'New Doctor Support Request',notice,'human_chat',now()))
+    c.commit(); out={'conversation_id':cid,'medicine':m['name'],'company':m['company'],'representative':{k:assigned_rep[k] for k in ['id','name','email','phone','job_title']},'ticket':ticket}; c.close(); return out
 
 @app.get('/api/human-conversations')
 def human_conversations(authorization: str|None=Header(default=None)):
     u=auth(authorization); c=db()
     if u['role'] == 'admin':
         c.close(); raise HTTPException(403,'Private human conversations are restricted to authorized company participants only')
+    common = '''
+        SELECT c.*,m.name medicine,
+               COALESCE(NULLIF(cu.company,''),cu.name) company,
+               sr.name representative,sr.email rep_email,sr.phone rep_phone,
+               du.name doctor,du.email doctor_email,t.ticket_no,t.status ticket_status,t.id ticket_id
+        FROM conversations c
+        LEFT JOIN medicines m ON m.id=c.medicine_id
+        LEFT JOIN users cu ON cu.role='pharma' AND (cu.id=COALESCE(c.company_id,c.company_user_id) OR cu.company_user_id=COALESCE(c.company_id,c.company_user_id))
+        LEFT JOIN users sr ON sr.id=COALESCE(c.sales_representative_id,c.sales_rep_id)
+        LEFT JOIN users du ON du.id=c.doctor_id
+        LEFT JOIN tickets t ON t.conversation_id=c.id
+        WHERE c.conversation_type='human'
+    '''
     if u['role']=='doctor':
-        q='''select c.*,m.name medicine,cu.company company,sr.name representative,sr.email rep_email,sr.phone rep_phone from conversations c left join medicines m on m.id=c.medicine_id left join users cu on cu.id=COALESCE(c.company_id,c.company_user_id) left join users sr on sr.id=COALESCE(c.sales_representative_id,c.sales_rep_id) where c.conversation_type='human' and c.doctor_id=? order by c.id desc'''; params=(u['id'],)
+        q=common+' AND c.doctor_id=? ORDER BY c.id DESC'; params=(u['id'],)
     elif u['role']=='pharma':
-        q='''select c.*,m.name medicine,du.name doctor,du.email doctor_email,sr.name representative,sr.email rep_email from conversations c left join medicines m on m.id=c.medicine_id left join users du on du.id=c.doctor_id left join users sr on sr.id=COALESCE(c.sales_representative_id,c.sales_rep_id) where c.conversation_type='human' and (COALESCE(c.company_id,c.company_user_id)=? or COALESCE(c.company_user_id,c.company_id)=?) order by c.id desc'''; params=(owner_company_id(u), owner_company_id(u))
+        q=common+' AND COALESCE(c.company_id,c.company_user_id)=? ORDER BY c.id DESC'; params=(owner_company_id(u),)
     elif u['role']=='sales_rep':
-        q='''select c.*,m.name medicine,du.name doctor,du.email doctor_email,sr.name representative,sr.email rep_email from conversations c left join medicines m on m.id=c.medicine_id left join users du on du.id=c.doctor_id left join users sr on sr.id=COALESCE(c.sales_representative_id,c.sales_rep_id) where c.conversation_type='human' and (COALESCE(c.company_id,c.company_user_id)=? or COALESCE(c.company_user_id,c.company_id)=?) order by c.id desc'''; params=(owner_company_id(u), owner_company_id(u))
+        q=common+' AND COALESCE(c.sales_representative_id,c.sales_rep_id)=? ORDER BY c.id DESC'; params=(u['id'],)
     else:
         c.close(); raise HTTPException(403,'Permission denied')
     out=rows(c.execute(q,params)); c.close(); return out
@@ -3145,13 +3328,44 @@ def human_conversation(cid:int,authorization: str|None=Header(default=None)):
     u=auth(authorization); c=db(); conv=c.execute('select * from conversations where id=? and conversation_type=\'human\'',(cid,)).fetchone()
     if not conv: raise HTTPException(404,'Human conversation not found')
     if not human_conversation_allowed(u, conv): raise HTTPException(403,'Conversation access denied')
-    out={'conversation':row(conv),'messages':rows(c.execute('select * from messages where conversation_id=? order by id',(cid,)))}; c.close(); return out
+    detail=row(conv)
+    company_id=resolve_conversation_company(conv)
+    company=c.execute("SELECT COALESCE(NULLIF(company,''),name) name FROM users WHERE role='pharma' AND (id=? OR company_user_id=?) ORDER BY id LIMIT 1",(company_id,company_id)).fetchone()
+    representative=c.execute('SELECT name FROM users WHERE id=?',(resolve_representative_id(conv),)).fetchone()
+    doctor=c.execute('SELECT name FROM users WHERE id=?',(conv['doctor_id'],)).fetchone()
+    medicine=c.execute('SELECT name FROM medicines WHERE id=?',(conv['medicine_id'],)).fetchone() if conv['medicine_id'] else None
+    detail['company_name']=company['name'] if company else 'Pharmaceutical company'
+    detail['representative_name']=representative['name'] if representative else 'Sales representative'
+    detail['doctor_name']=doctor['name'] if doctor else 'Doctor'
+    detail['medicine_name']=medicine['name'] if medicine else None
+    ticket=c.execute('select * from tickets where conversation_id=? order by id desc limit 1',(cid,)).fetchone()
+    events=rows(c.execute('SELECT e.*,u.name actor_name FROM ticket_events e LEFT JOIN users u ON u.id=e.actor_id WHERE e.ticket_id=? ORDER BY e.id',(ticket['id'],))) if ticket else []
+    out={'conversation':detail,'messages':rows(c.execute('select * from messages where conversation_id=? order by id',(cid,))),'ticket':row(ticket) if ticket else None,'ticket_events':events}; c.close(); return out
 @app.post('/api/human-conversations/{cid}/messages')
 def human_message(cid:int,x:HumanMessage,authorization: str|None=Header(default=None)):
     u=auth(authorization); c=db(); conv=c.execute('select * from conversations where id=? and conversation_type=\'human\'',(cid,)).fetchone()
     if not conv: raise HTTPException(404,'Conversation not found')
     if not human_conversation_allowed(u, conv): raise HTTPException(403,'Conversation access denied')
-    c.execute('insert into messages(conversation_id,sender,agent,content,risk,created_at) values(?,?,?,?,?,?)',(cid,'human',u['name'],x.content,'human',now())); c.commit(); c.close(); return {'ok':True}
+    sent_at=now()
+    c.execute('insert into messages(conversation_id,sender,sender_id,sender_role,agent,message,content,risk,created_at) values(?,?,?,?,?,?,?,?,?)',(cid,'human',u['id'],u['role'],u['name'],x.content,x.content,'human',sent_at))
+    c.execute('UPDATE conversations SET updated_at=?,last_message_at=? WHERE id=?',(sent_at,sent_at,cid))
+    ticket=c.execute('SELECT * FROM tickets WHERE conversation_id=?',(cid,)).fetchone()
+    if ticket:
+        event_type='representative_responded' if u['role']=='sales_rep' else 'doctor_message' if u['role']=='doctor' else 'company_message'
+        c.execute('INSERT INTO ticket_events(ticket_id,actor_id,actor_role,event_type,created_at) VALUES(?,?,?,?,?)',(ticket['id'],u['id'],u['role'],event_type,sent_at))
+    doctor_id=conv['doctor_id']; rep_id=resolve_representative_id(conv)
+    if u['role']=='doctor':
+        recipients={rep_id} if rep_id else set()
+        company_id=resolve_conversation_company(conv)
+        recipients.update(r['id'] for r in c.execute("SELECT id FROM users WHERE role='pharma' AND (id=? OR company_user_id=?)",(company_id,company_id)).fetchall())
+    elif u['role']=='sales_rep':
+        recipients={doctor_id}
+    else:
+        recipients={doctor_id,rep_id}
+    recipients.discard(None); recipients.discard(u['id'])
+    for recipient_id in recipients:
+        c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)',(recipient_id,'New Human Support Message',f'{u["name"]} sent a message in your company support conversation.','human_chat',sent_at))
+    c.commit(); c.close(); return {'ok':True,'created_at':sent_at}
 
 # ---- Sales representatives ----
 @app.get('/api/reps')
@@ -3213,25 +3427,65 @@ def admin_verify(uid:int,x:VerifyIn,authorization: str|None=Header(default=None)
 
 @app.get('/api/tickets')
 def tickets(authorization: str|None=Header(default=None)):
-    u=auth(authorization); c=db(); q='select t.*,u.name doctor from tickets t join users u on u.id=t.user_id'; params=()
-    if u['role']=='doctor': q+=' where t.user_id=?'; params=(u['id'],)
-    elif u['role'] in ('pharma','sales_rep'): q+=' where t.user_id in (select id from users where role=\'doctor\')'
-    out=rows(c.execute(q+' order by t.id desc',params)); c.close(); return out
+    u=auth(authorization); c=db()
+    q='''SELECT t.*,
+                d.name doctor,
+                (SELECT COALESCE(NULLIF(co.company,''),co.name) FROM users co
+                 WHERE co.role='pharma' AND (co.id=t.company_id OR co.company_user_id=t.company_id)
+                 ORDER BY co.id LIMIT 1) company,
+                sr.name representative,m.name medicine
+         FROM tickets t
+         LEFT JOIN users d ON d.id=COALESCE(t.doctor_id,t.user_id)
+         LEFT JOIN users sr ON sr.id=t.sales_representative_id
+         LEFT JOIN medicines m ON m.id=t.medicine_id'''
+    if u['role']=='doctor':
+        q+=' WHERE COALESCE(t.doctor_id,t.user_id)=?'; params=(u['id'],)
+    elif u['role']=='pharma':
+        q+=' WHERE t.conversation_id IS NOT NULL AND t.company_id=?'; params=(owner_company_id(u),)
+    elif u['role']=='sales_rep':
+        q+=' WHERE t.conversation_id IS NOT NULL AND t.sales_representative_id=?'; params=(u['id'],)
+    elif u['role']=='admin':
+        q+=' WHERE t.conversation_id IS NULL'; params=()
+    else:
+        c.close(); raise HTTPException(403,'Permission denied')
+    out=rows(c.execute(q+' ORDER BY t.id DESC',params))
+    for ticket in out:
+        ticket['events']=rows(c.execute('SELECT * FROM ticket_events WHERE ticket_id=? ORDER BY id',(ticket['id'],)))
+    c.close(); return out
 @app.post('/api/tickets')
 def create_ticket(x:TicketIn,authorization: str|None=Header(default=None)):
-    u=auth(authorization); c=db(); no='TKT-'+str(2000+c.execute('select count(*) x from tickets').fetchone()['x']+1); t=now(); c.execute('insert into tickets(ticket_no,user_id,subject,content,priority,department,status,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)',(no,u['id'],x.subject,x.content,x.priority,x.department,'Open',t,t)); c.commit(); c.close(); return {'ticket_no':no,'status':'Open'}
+    u=auth(authorization); c=db(); t=now(); ticket_id=c.execute('insert into tickets(user_id,subject,content,priority,department,status,created_at,updated_at) values(?,?,?,?,?,?,?,?)',(u['id'],x.subject,x.content,x.priority,x.department,'Open',t,t)).lastrowid; no=f'TKT-{2000 + int(ticket_id)}'; c.execute('UPDATE tickets SET ticket_no=? WHERE id=?',(no,ticket_id)); c.commit(); c.close(); return {'ticket_no':no,'status':'Open'}
 @app.patch('/api/tickets/{tid}')
 def update_ticket(tid:int,x:TicketUpdate,authorization: str|None=Header(default=None)):
     u=auth(authorization)
-    if u['role'] not in ('pharma','admin'): raise HTTPException(403,'Permission denied')
-    c=db(); existing = c.execute('select id from tickets where id=?',(tid,)).fetchone();
+    c=db(); existing = c.execute('select * from tickets where id=?',(tid,)).fetchone()
     if not existing:
         c.close(); raise HTTPException(404,'Ticket not found')
-    result = c.execute('update tickets set status=?,updated_at=? where id=?',(x.status,now(),tid))
-    c.commit(); c.close();
-    if result.rowcount == 0:
-        raise HTTPException(404,'Ticket not found')
-    return {'ok':True}
+    old_status=existing['status'] or 'Open'
+    if existing['conversation_id'] is not None:
+        conv=c.execute("SELECT * FROM conversations WHERE id=? AND conversation_type='human'",(existing['conversation_id'],)).fetchone()
+        if not conv or not human_conversation_allowed(u,conv):
+            c.close(); raise HTTPException(403,'Ticket access denied')
+        status_map={'open':'Open','in progress':'In Progress','waiting for doctor':'Waiting for Doctor','waiting for company':'Waiting for Company','resolved':'Resolved','reopened':'Reopened','closed':'Closed'}
+        normalized=str(x.status or '').strip().replace('_',' ').lower()
+        new_status=status_map.get(normalized)
+        if not new_status:
+            c.close(); raise HTTPException(400,'Invalid human support ticket status')
+        if u['role']=='doctor' and new_status not in ('Resolved','Reopened'):
+            c.close(); raise HTTPException(403,'Doctors may only request resolution or reopen a ticket')
+        timestamp=now()
+        c.execute('UPDATE tickets SET status=?,updated_at=?,resolved_at=?,closed_at=?,resolved_by=? WHERE id=?',(new_status,timestamp,timestamp if new_status=='Resolved' else None,timestamp if new_status=='Closed' else None,u['id'] if new_status=='Resolved' else None,tid))
+        if old_status != new_status:
+            c.execute('INSERT INTO ticket_events(ticket_id,actor_id,actor_role,event_type,old_status,new_status,created_at) VALUES(?,?,?,?,?,?,?)',(tid,u['id'],u['role'],'status_changed',old_status,new_status,timestamp))
+            for recipient_id in _human_participant_ids(c,conv):
+                if recipient_id != u['id']:
+                    c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)',(recipient_id,'Support Ticket Updated',f'Ticket {existing["ticket_no"]} status changed to {new_status}.','human_ticket',timestamp))
+    else:
+        if u['role'] not in ('pharma','admin'):
+            c.close(); raise HTTPException(403,'Permission denied')
+        new_status=x.status
+        c.execute('UPDATE tickets SET status=?,updated_at=? WHERE id=?',(new_status,now(),tid))
+    c.commit(); updated=row(c.execute('SELECT * FROM tickets WHERE id=?',(tid,)).fetchone()); c.close(); return {'ok':True,'ticket':updated}
 @app.get('/api/notifications')
 def notifications(authorization: str|None=Header(default=None)):
     u=auth(authorization); c=db(); out=rows(c.execute('select * from notifications where user_id=? order by id desc',(u['id'],))); c.close(); return out

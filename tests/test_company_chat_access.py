@@ -78,15 +78,15 @@ def seed_company_chat_data(db_path):
         )
         conn.execute(
             "INSERT INTO conversations(user_id,role,conversation_type,doctor_id,company_id,sales_representative_id,company_user_id,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (1, 'doctor', 'human', 1, 101, 4, 101, 'open', main.now()),
+            (1, 'doctor', 'human', 1, 101, 6, 101, 'open', main.now()),
         )
         conn.execute(
             "INSERT INTO conversations(user_id,role,conversation_type,doctor_id,company_id,sales_representative_id,company_user_id,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (1, 'doctor', 'human', 1, 102, 5, 102, 'open', main.now()),
+            (1, 'doctor', 'human', 1, 102, 7, 102, 'open', main.now()),
         )
         conn.execute(
             "INSERT INTO conversations(user_id,role,conversation_type,doctor_id,company_id,sales_representative_id,company_user_id,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (1, 'doctor', 'human', 1, 103, 6, 103, 'open', main.now()),
+            (1, 'doctor', 'human', 1, 103, 8, 103, 'open', main.now()),
         )
         conn.commit()
 
@@ -98,7 +98,7 @@ def test_company_chat_access_matrix_is_enforced():
         with TestClient(main.app) as client:
             doctor_token = main.token({'id': 1, 'role': 'doctor'})
             company_a_token = main.token({'id': 3, 'role': 'pharma', 'company_user_id': 101})
-            rep_a_token = main.token({'id': 4, 'role': 'sales_rep', 'company_user_id': 101})
+            rep_a_token = main.token({'id': 6, 'role': 'sales_rep', 'company_user_id': 101})
             doctor_b_token = main.token({'id': 2, 'role': 'doctor'})
 
             doctor_list = client.get('/api/conversations', headers={'Authorization': f'Bearer {doctor_token}'})
@@ -113,6 +113,25 @@ def test_company_chat_access_matrix_is_enforced():
             rep_a_access = client.get('/api/conversations/2', headers={'Authorization': f'Bearer {rep_a_token}'})
             assert rep_a_access.status_code == 403, rep_a_access.text
 
+            doctor_assignment = client.patch(
+                '/api/conversations/1',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'sales_representative_id': 7},
+            )
+            assert doctor_assignment.status_code == 403
+            cross_company_assignment = client.post(
+                '/api/conversations/1/assign',
+                headers={'Authorization': f'Bearer {company_a_token}'},
+                json={'sales_representative_id': 7},
+            )
+            assert cross_company_assignment.status_code == 400
+            doctor_status_patch = client.patch(
+                '/api/conversations/1',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'status': 'closed'},
+            )
+            assert doctor_status_patch.status_code == 400
+
             doctor_b_access = client.get('/api/conversations/1', headers={'Authorization': f'Bearer {doctor_b_token}'})
             assert doctor_b_access.status_code == 403, doctor_b_access.text
 
@@ -123,5 +142,158 @@ def test_company_chat_access_matrix_is_enforced():
             )
             assert create_response.status_code == 200, create_response.text
             assert create_response.json()['company_id'] == 101
+    finally:
+        cleanup_temp_db(db_path)
+
+
+def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
+    db_path = setup_temp_db()
+    try:
+        seed_company_chat_data(db_path)
+        with TestClient(main.app) as client:
+            doctor_token = main.token({'id': 1, 'role': 'doctor'})
+            doctor_b_token = main.token({'id': 2, 'role': 'doctor'})
+            company_a_token = main.token({'id': 3, 'role': 'pharma', 'company_user_id': 101})
+            company_b_token = main.token({'id': 4, 'role': 'pharma', 'company_user_id': 102})
+            rep_a_token = main.token({'id': 6, 'role': 'sales_rep', 'company_user_id': 101})
+            rep_b_token = main.token({'id': 7, 'role': 'sales_rep', 'company_user_id': 102})
+
+            directory = client.get('/api/doctor/pharma-companies', headers={'Authorization': f'Bearer {doctor_token}'})
+            assert directory.status_code == 200, directory.text
+            assert {company['company_id'] for company in directory.json()} == {3, 4, 5}
+            handoff = client.post('/api/ai/human-handoff', headers={'Authorization': f'Bearer {doctor_token}'}, json={'message': 'Connect me to sales'})
+            assert handoff.status_code == 200, handoff.text
+            assert handoff.json()['status'] == 'company_selection'
+            assert len(handoff.json()['companies']) == 3
+
+            started = client.post(
+                '/api/conversations',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'company_id': 101},
+            )
+            assert started.status_code == 200, started.text
+            conversation = started.json()
+            ticket = conversation['ticket']
+            assert ticket['conversation_id'] == conversation['id']
+            assert ticket['doctor_id'] == 1
+            assert ticket['company_id'] == 101
+            assert ticket['sales_representative_id'] == 6
+            assert ticket['ticket_no'].startswith('TKT-')
+            assert ticket['status'] == 'Open'
+
+            sent = client.post(
+                f'/api/human-conversations/{conversation["id"]}/messages',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'content': 'I need help with this product.'},
+            )
+            assert sent.status_code == 200, sent.text
+            rep_detail = client.get(
+                f'/api/human-conversations/{conversation["id"]}',
+                headers={'Authorization': f'Bearer {rep_a_token}'},
+            )
+            assert rep_detail.status_code == 200, rep_detail.text
+            assert rep_detail.json()['messages'][0]['content'] == 'I need help with this product.'
+            assert rep_detail.json()['ticket']['ticket_no'] == ticket['ticket_no']
+
+            reply = client.post(
+                f'/api/human-conversations/{conversation["id"]}/messages',
+                headers={'Authorization': f'Bearer {rep_a_token}'},
+                json={'content': 'I will share the approved product materials.'},
+            )
+            assert reply.status_code == 200, reply.text
+            doctor_detail = client.get(
+                f'/api/human-conversations/{conversation["id"]}',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+            )
+            assert len(doctor_detail.json()['messages']) == 2
+            assert doctor_detail.json()['ticket_events'][-1]['event_type'] == 'representative_responded'
+            assert client.get('/api/notifications', headers={'Authorization': f'Bearer {doctor_token}'}).json()[0]['title'] == 'New Human Support Message'
+
+            assert client.get('/api/tickets', headers={'Authorization': f'Bearer {company_a_token}'}).json()[0]['ticket_no'] == ticket['ticket_no']
+            assert client.get('/api/tickets', headers={'Authorization': f'Bearer {company_b_token}'}).json() == []
+            assert client.get('/api/tickets', headers={'Authorization': f'Bearer {rep_b_token}'}).json() == []
+            assert client.get(f'/api/human-conversations/{conversation["id"]}', headers={'Authorization': f'Bearer {rep_b_token}'}).status_code == 403
+            assert client.get(f'/api/human-conversations/{conversation["id"]}', headers={'Authorization': f'Bearer {main.token({"id": 1, "role": "admin"})}'}).status_code == 403
+            assert client.patch(f'/api/tickets/{ticket["id"]}', headers={'Authorization': f'Bearer {rep_b_token}'}, json={'status': 'CLOSED'}).status_code == 403
+            assert client.patch(f'/api/tickets/{ticket["id"]}', headers={'Authorization': f'Bearer {company_b_token}'}, json={'status': 'CLOSED'}).status_code == 403
+
+            changed = client.patch(
+                f'/api/tickets/{ticket["id"]}',
+                headers={'Authorization': f'Bearer {rep_a_token}'},
+                json={'status': 'IN_PROGRESS'},
+            )
+            assert changed.status_code == 200, changed.text
+            doctor_tickets = client.get('/api/tickets', headers={'Authorization': f'Bearer {doctor_token}'}).json()
+            company_tickets = client.get('/api/tickets', headers={'Authorization': f'Bearer {company_a_token}'}).json()
+            assert doctor_tickets[0]['status'] == 'In Progress'
+            assert company_tickets[0]['status'] == 'In Progress'
+
+            resolved = client.patch(
+                f'/api/tickets/{ticket["id"]}',
+                headers={'Authorization': f'Bearer {rep_a_token}'},
+                json={'status': 'RESOLVED'},
+            )
+            assert resolved.status_code == 200, resolved.text
+            assert client.get('/api/tickets', headers={'Authorization': f'Bearer {doctor_token}'}).json()[0]['status'] == 'Resolved'
+            reopened = client.patch(
+                f'/api/tickets/{ticket["id"]}',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'status': 'REOPENED'},
+            )
+            assert reopened.status_code == 200, reopened.text
+            assert client.get('/api/tickets', headers={'Authorization': f'Bearer {company_a_token}'}).json()[0]['status'] == 'Reopened'
+
+            denied = client.get(
+                f'/api/human-conversations/{conversation["id"]}',
+                headers={'Authorization': f'Bearer {doctor_b_token}'},
+            )
+            assert denied.status_code == 403
+    finally:
+        cleanup_temp_db(db_path)
+
+
+def test_company_without_eligible_rep_is_not_offered_as_available_or_chat_created():
+    db_path = setup_temp_db()
+    try:
+        seed_company_chat_data(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE users SET verification_status='pending' WHERE id=8")
+            conn.commit()
+        with TestClient(main.app) as client:
+            doctor_token = main.token({'id': 1, 'role': 'doctor'})
+            directory = client.get('/api/doctor/pharma-companies', headers={'Authorization': f'Bearer {doctor_token}'})
+            assert directory.status_code == 200, directory.text
+            company = next(item for item in directory.json() if item['company_id'] == 5)
+            assert not company['available_contact']
+            assert company['reps_count'] == 0
+
+            response = client.post(
+                '/api/conversations',
+                headers={'Authorization': f'Bearer {doctor_token}'},
+                json={'company_id': 5},
+            )
+            assert response.status_code == 404
+            assert 'unavailable for live chat' in response.json()['detail']
+            chats = client.get('/api/human-conversations', headers={'Authorization': f'Bearer {doctor_token}'}).json()
+            assert {chat['id'] for chat in chats} == {1, 2, 3}
+    finally:
+        cleanup_temp_db(db_path)
+
+
+def test_synthetic_human_chat_seed_is_idempotent_and_uses_existing_users():
+    from backend.seed_demo_human_chat import seed_demo_human_chat
+
+    db_path = setup_temp_db()
+    try:
+        seed_company_chat_data(db_path)
+        first = seed_demo_human_chat()
+        second = seed_demo_human_chat()
+        assert first['conversation_id'] == second['conversation_id']
+        assert first['ticket_no'] == second['ticket_no']
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM conversations WHERE conversation_type='human'").fetchone()[0] == 4
+            assert conn.execute("SELECT COUNT(*) FROM tickets WHERE conversation_id=?", (first['conversation_id'],)).fetchone()[0] == 1
+            assert conn.execute('SELECT COUNT(*) FROM messages WHERE conversation_id=?', (first['conversation_id'],)).fetchone()[0] == 4
+            assert conn.execute("SELECT subject FROM tickets WHERE conversation_id=?", (first['conversation_id'],)).fetchone()[0] == 'DEMO / SYNTHETIC CONVERSATION'
     finally:
         cleanup_temp_db(db_path)

@@ -2,10 +2,10 @@ const API_URL = (window.PHARMAAI_API_URL || '').replace(/\/+$/, '');
 const API = `${API_URL}/api`;
 let token = localStorage.getItem('pharmaai_token');
 let me = JSON.parse(localStorage.getItem('pharmaai_user') || 'null');
-let role = me?.role || 'doctor', page = 'dashboard', authMode = 'login', currentConversationId = null, humanConversationId = null, notificationItems = [], hiddenRepIds = [], navigationRequest = 0;
+let role = me?.role || 'doctor', page = 'dashboard', authMode = 'login', currentConversationId = null, humanConversationId = null, notificationItems = [], hiddenRepIds = [], navigationRequest = 0, humanRefreshTimer = null;
 const navs = {
     pharma: [['dashboard', '⌂', 'Command Center'], ['medicines', '▦', 'Medicine Library'], ['knowledge', '◇', 'Knowledge Center'], ['doctors', '◉', 'Doctor Intelligence'], ['reps', '♙', 'Sales Representatives'], ['agent', '✦', 'AI Sales Agent'], ['human', '◌', 'Doctor Chats'], ['orders', '□', 'Orders'], ['tickets', '!', 'Escalations']],
-    sales_rep: [['dashboard', '⌂', 'Sales Workspace'], ['medicines', '▦', 'My Products'], ['doctors', '◉', 'Doctor Intelligence'], ['agent', '✦', 'AI Sales Agent'], ['human', '◌', 'Doctor Chats'], ['orders', '□', 'Orders']],
+    sales_rep: [['dashboard', '⌂', 'Sales Workspace'], ['medicines', '▦', 'My Products'], ['doctors', '◉', 'Doctor Intelligence'], ['agent', '✦', 'AI Sales Agent'], ['human', '◌', 'Doctor Chats'], ['tickets', '!', 'My Support Tickets'], ['orders', '□', 'Orders']],
     doctor: [['dashboard', '⌂', 'My Dashboard'], ['medicines', '▦', 'Medicine Hub'], ['agent', '✦', 'AI Medical Assistant'], ['human', '◌', 'Company Chats'], ['orders', '□', 'My Requests'], ['tickets', '!', 'Human Support'], ['profile', '○', 'My Profile']],
     admin: [['dashboard', '⌂', 'Owner Command Center'], ['users', '◉', 'Verification & Users'], ['agent', '✦', 'Owner AI Agent']]
 };
@@ -216,8 +216,7 @@ function renderShell() { const nav = navs[role] || navs.doctor; const userName =
 function updateNav() { document.querySelectorAll('.nav button[data-page]').forEach(button => button.classList.toggle('active', button.dataset.page === page)) }
 function go(p) { if (!navs[role]?.some(n => n[0] === p)) return; page = p; const routeMap = { dashboard: '/dashboard', medicines: '/medicines', knowledge: '/knowledge', doctors: '/doctors', reps: '/reps', agent: '/agent', human: '/human', orders: '/orders', tickets: '/tickets', profile: '/profile', users: '/users' }; if (routeMap[p]) window.history.pushState({}, '', routeMap[p]); updateNav(); loadPage() }
 function title() { return { dashboard: role === 'admin' ? 'Owner Command Center' : role === 'pharma' ? 'Command Center' : role === 'sales_rep' ? 'Sales Workspace' : 'My Practice Dashboard', medicines: role === 'doctor' ? 'Medicine Hub' : 'Medicine Library', knowledge: 'Knowledge Center', doctors: 'Doctor Intelligence', reps: 'Sales Representatives', agent: role === 'doctor' ? 'AI Medical Assistant' : role === 'admin' ? 'Owner AI Agent' : 'AI Sales Agent', human: role === 'doctor' ? 'Company Chats' : 'Doctor Chats', orders: role === 'doctor' ? 'My Requests' : 'Orders', tickets: role === 'doctor' ? 'Human Support' : 'Escalations', profile: 'My Profile', users: 'Verification & Users' }[page] || 'PharmaAI' }
-async function loadPage() { const request = ++navigationRequest, targetPage = page; document.getElementById('title').textContent = title(); updateNav(); const el = document.getElementById('page'); el.innerHTML = '<div class="empty">Loading workspace…</div>'; try { if (targetPage === 'dashboard') await dashboard(el); else if (targetPage === 'medicines') await medicines(el); else if (targetPage === 'knowledge') await knowledge(el); else if (targetPage === 'doctors') await doctors(el); else if (targetPage === 'reps') await reps(el); else if (targetPage === 'agent') agent(el); else if (targetPage === 'human') await human(el); else if (targetPage === 'orders') await orders(el); else if (targetPage === 'tickets') await tickets(el); else if (targetPage === 'profile') await profile(el); else if (targetPage === 'users') await adminUsers(el); if (request !== navigationRequest) { loadPage(); return } } catch (e) { if (request === navigationRequest) el.innerHTML = `<div class="card empty">${esc(e.message)}</div>` } }
-async function loadPage() { const request = ++navigationRequest, targetPage = page; document.getElementById('title').textContent = title(); updateNav(); const el = document.getElementById('page'); el.innerHTML = '<div class="empty">Loading workspace…</div>'; try { if (targetPage === 'dashboard') await dashboard(el); else if (targetPage === 'medicines') await medicines(el); else if (targetPage === 'knowledge') await knowledge(el); else if (targetPage === 'doctors') await doctors(el); else if (targetPage === 'reps') await reps(el); else if (targetPage === 'agent') agent(el); else if (targetPage === 'human') await human(el); else if (targetPage === 'orders') await orders(el); else if (targetPage === 'tickets') await tickets(el); else if (targetPage === 'profile') await profile(el); else if (targetPage === 'users') await adminUsers(el); if (request !== navigationRequest) { loadPage(); return } normalizeCurrencyDisplay(); } catch (e) { if (request === navigationRequest) el.innerHTML = `<div class="card empty">${esc(e.message)}</div>` } }
+async function loadPage() { clearInterval(humanRefreshTimer); humanRefreshTimer = null; const request = ++navigationRequest, targetPage = page; document.getElementById('title').textContent = title(); updateNav(); const el = document.getElementById('page'); el.innerHTML = '<div class="empty">Loading workspace…</div>'; try { if (targetPage === 'dashboard') await dashboard(el); else if (targetPage === 'medicines') await medicines(el); else if (targetPage === 'knowledge') await knowledge(el); else if (targetPage === 'doctors') await doctors(el); else if (targetPage === 'reps') await reps(el); else if (targetPage === 'agent') agent(el); else if (targetPage === 'human') await human(el); else if (targetPage === 'orders') await orders(el); else if (targetPage === 'tickets') await tickets(el); else if (targetPage === 'profile') await profile(el); else if (targetPage === 'users') await adminUsers(el); if (request !== navigationRequest) { loadPage(); return } normalizeCurrencyDisplay(); } catch (e) { if (request === navigationRequest) el.innerHTML = `<div class="card empty">${esc(e.message)}</div>` } }
 function hero(ey, h, p, a = '') { return `<div class="hero"><div><div class="ey">${ey}</div><h2>${h}</h2><p>${p}</p></div>${a}</div>` }
 async function dashboard(el) { const d = await api(role === 'admin' ? '/admin/overview' : '/dashboard'); if (role === 'admin') { el.innerHTML = hero('OWNER ONLY', 'PharmaAI Platform Command Center', 'The owner sees the entire network: doctors, pharmaceutical companies, representatives, verification, RAG documents and human conversations.', '<span class="tag">PRIVATE ADMIN</span>') + `<div class="grid kpis"><div class="card kpi"><span class="label">DOCTORS</span><h3>${d.doctors}</h3><span class="up">Registered accounts</span></div><div class="card kpi"><span class="label">PHARMA COMPANIES</span><h3>${d.pharma}</h3><span class="up">Verified + pending</span></div><div class="card kpi"><span class="label">SALES REPS</span><h3>${d.reps}</h3><span class="up">Company-managed users</span></div><div class="card kpi"><span class="label">PENDING VERIFICATION</span><h3>${d.pending}</h3><span class="up">Owner review queue</span></div></div><div class="grid two"><div class="card"><div class="head"><h3>Platform knowledge</h3></div><div class="match"><div><b>${d.medicines} medicines</b><span>Across all companies</span></div><span class="tag">CATALOG</span></div><div class="match"><div><b>${d.documents} documents</b><span>RAG knowledge sources</span></div><span class="tag">RAG</span></div></div><div class="card"><div class="head"><h3>Human support network</h3></div><div class="match"><div><b>${d.human_chats} human chats</b><span>Doctor ↔ representative</span></div><span class="tag">LIVE</span></div><div class="match"><div><b>${d.open_tickets} open escalations</b><span>Safety and expert review</span></div><span class="tag">SAFETY</span></div></div></div>`; return } el.innerHTML = hero(role === 'pharma' ? 'TODAY · LIVE' : role === 'sales_rep' ? 'SALES OPERATIONS' : 'YOUR PRACTICE', role === 'pharma' ? `Good afternoon, ${esc(me.company)}.` : role === 'sales_rep' ? `Good afternoon, ${esc(me.name)}.` : `Good afternoon, ${esc(me.name)}.`, `Your agent workforce is connected to approved knowledge, doctor intelligence and human support.`, '<span class="tag">● SYSTEM LIVE</span>') + `<div class="grid kpis"><div class="card kpi"><span class="label">${role === 'doctor' ? 'PRODUCT REQUESTS' : 'PRODUCT SALES'}</span><h3>${role === 'doctor' ? '$' + Number(d.sales).toLocaleString() : '$' + (Number(d.sales) / 1000).toFixed(1) + 'K'}</h3><span class="up">Live database</span></div><div class="card kpi"><span class="label">ACTIVE DOCTORS</span><h3>${d.doctors || 0}</h3><span class="up">Verified network</span></div><div class="card kpi"><span class="label">${role === 'doctor' ? 'MATCHED PRODUCTS' : 'MEDICINES'}</span><h3>${role === 'doctor' ? d.matched.length : d.medicines}</h3><span class="up">AI matching active</span></div><div class="card kpi"><span class="label">${role === 'doctor' ? 'EST. EARNINGS' : 'SALES REPS'}</span><h3>${role === 'doctor' ? '$' + Number(d.earnings).toFixed(0) : d.reps}</h3><span class="up">Human + AI workflows</span></div></div>` + (role === 'doctor' ? `<div class="card"><div class="head"><h3>Medicines matched to your specialty</h3><button class="link" onclick="go('medicines')">Open Medicine Hub →</button></div>${d.matched.length ? d.matched.map(m => medicineMini(m)).join('') : '<div class="empty">No exact specialty matches yet.</div>'}</div>` : `<div class="grid two"><div class="card"><div class="head"><h3>Product performance</h3><button class="link" onclick="go('medicines')">Manage →</button></div>${(d.top || []).map((m, i) => `<div class="bar-row"><span>${esc(m.name)}</span><div class="bar"><i style="width:${Math.max(18, 100 - i * 22)}%"></i></div><b>$${Number(m.sales).toLocaleString()}</b></div>`).join('')}</div><div class="card"><div class="head"><h3>Agent workforce</h3></div>${['Supervisor Agent', 'Product Knowledge + RAG', 'Doctor Intelligence', 'Sales Agent', 'Risk & Escalation Agent', 'Human Handoff'].map(x => `<div class="match"><div><b>${x}</b><span>Operational</span></div><span class="tag">ACTIVE</span></div>`).join('')}</div></div>`) }
 function medicineMini(m) { return `<div class="match"><div><b>${esc(m.name)}</b><span>${esc(m.company)} · ${esc(m.category)}</span></div><div class="match-actions"><span class="pill">${esc(formatPrice(m.price))}</span><button class="secondary" onclick="contactRep(${m.id})">Talk to representative</button></div></div>` }
@@ -238,7 +237,34 @@ async function deleteItem(type, id) { const button = document.querySelector('#de
 function agent(el) { const label = role === 'doctor' ? 'Medical Assistant' : role === 'admin' ? 'Owner AI Agent' : 'Sales Agent'; el.innerHTML = hero('CONVERSATIONAL MULTI-AGENT', `AI ${label}`, 'Talk normally. The supervisor decides whether your request needs RAG, structured company data, doctor intelligence, sales tools, safety review or human handoff.', '<span class="tag">● AGENTS ONLINE</span>') + `<div class="grid agent-layout"><div class="card chat"><div class="agent-head"><div class="agent-id"><div class="orb">✦</div><div><b>PharmaAI Supervisor</b><span>Natural conversation · tool routing · RAG</span></div></div><span class="online">● ONLINE</span></div><div class="chatbody" id="chatbody"><div class="msg ai">${role === 'pharma' ? `Hello ${esc(me.name)}! I’m your PharmaAI company agent. Ask me anything about your company workflow, doctors, medicines, RAG or sales team.` : role === 'sales_rep' ? `Hello ${esc(me.name)}! I’m your sales workspace agent. I can help with products, doctors, approved information and human conversations.` : role === 'admin' ? `Hello Owner. I can summarize the platform, verification queue, doctors, companies, representatives and human-support network.` : `Hello ${esc(me.name)}! I’m your PharmaAI doctor assistant. I can answer general questions, search approved medicine knowledge and connect you with a real company representative.`}<small>Supervisor Agent · now</small></div></div><div class="quick-row">${(role === 'pharma' ? ['Hello', 'Show all new doctors', 'Help me upload a medicine', 'Show my sales representatives'] : role === 'doctor' ? ['Hello', 'What medicines match me?', 'Tell me about Cardiovex 10', 'Connect me to a sales representative'] : ['Hello', 'Show my doctors', 'Show company products', 'Show human chats']).map(q => `<button onclick="quickChat('${q.replace(/'/g, "\\'")}')">${q}</button>`).join('')}</div><div class="chatbar"><input id="chatinput" placeholder="Message PharmaAI…" onkeydown="if(event.key==='Enter')sendChat()"><button onclick="sendChat()">↑</button></div></div><div class="agentcards">${['Supervisor Agent', 'Product Knowledge + RAG', 'Doctor Intelligence', 'Sales / Commercial Tools', 'Risk & Escalation', 'Human Handoff'].map((x, i) => `<div class="card agentcard"><div class="agentmini">${['◈', '✚', '◉', '↗', '!', '◌'][i]}</div><div><b>${x}</b><span>${['Intent routing', 'Grounded medicine knowledge', 'Specialty matching', 'Structured facts', 'Safety gate', 'Real person chat'][i]}</span></div></div>`).join('')}</div></div>` }
 function quickChat(q) { document.getElementById('chatinput').value = q; sendChat() }
 function startChat(q) { go('agent'); setTimeout(() => quickChat(q), 250) }
-async function sendChat() { const i = document.getElementById('chatinput'), b = document.getElementById('chatbody'), msg = i.value.trim(); if (!msg) return; b.innerHTML += `<div class="msg user">${esc(msg)}<small>You · now</small></div>`; i.value = ''; b.innerHTML += `<div id="typing" class="msg ai typing">Thinking…<small>Supervisor · routing agents</small></div>`; b.scrollTop = b.scrollHeight; try { const x = await api('/chat', { method: 'POST', body: JSON.stringify({ message: msg, conversation_id: currentConversationId }) }); currentConversationId = x.conversation_id; document.getElementById('typing')?.remove(); const used = (x.tools || []).filter(t => t && t.tool); const dbTrace = used.length ? `<div class="sources"><b>Live database</b>${used.map(t => `<span>${esc(String(t.tool).replace(/_/g, ' '))}${t.ok === false ? ' · unavailable' : ''}</span>`).join('')}</div>` : ''; b.innerHTML += `<div class="msg ai">${formatText(x.message)}<small>${esc(x.agent)} · ${esc(x.provider || 'LLM')} · ${esc(x.risk)}</small>${(x.sources || []).length ? `<div class="sources"><b>RAG sources</b>${x.sources.map(s => `<span>[${s.source_no}] ${esc(s.filename)} · chunk ${s.chunk} · ${Math.round(s.score * 100)}%</span>`).join('')}</div>` : ''}${dbTrace}${x.ticket_no ? `<button class="secondary" onclick="go('tickets')">Open ${esc(x.ticket_no)}</button>` : ''}</div>`; if (x.risk === 'critical') toast('Human escalation opened') } catch (e) { document.getElementById('typing')?.remove(); toast(e.message) } b.scrollTop = b.scrollHeight }
+async function sendChat() {
+    const input = document.getElementById('chatinput'), body = document.getElementById('chatbody'), message = input.value.trim();
+    if (!message) return;
+    body.innerHTML += `<div class="msg user">${esc(message)}<small>You · now</small></div>`;
+    input.value = '';
+    body.innerHTML += '<div id="typing" class="msg ai typing">Connecting…<small>Supervisor · routing</small></div>';
+    body.scrollTop = body.scrollHeight;
+    try {
+        if (role === 'doctor' && /\b(connect|talk|speak|contact|human|real person)\b.{0,70}\b(sales representative|sales rep|representative|company|human support|real person)\b/i.test(message)) {
+            const handoff = await api('/ai/human-handoff', { method: 'POST', body: JSON.stringify({ message }) });
+            document.getElementById('typing')?.remove();
+            const choices = handoff.companies.length ? handoff.companies.map(company => `<button class="secondary small" ${company.available_contact ? '' : 'disabled'} onclick="startCompanyConversation(${company.company_id})">${esc(company.company_name || company.company || 'Pharmaceutical company')}${company.available_contact ? '' : ' · unavailable'}</button>`).join('') : '<span>No eligible company representatives are currently available.</span>';
+            body.innerHTML += `<div class="msg ai">Choose a pharmaceutical company to start a real human support conversation.<div class="quick-row">${choices}</div><small>Human sales handoff · live company directory</small></div>`;
+        } else {
+            const x = await api('/chat', { method: 'POST', body: JSON.stringify({ message, conversation_id: currentConversationId }) });
+            currentConversationId = x.conversation_id;
+            document.getElementById('typing')?.remove();
+            const used = (x.tools || []).filter(tool => tool && tool.tool);
+            const dbTrace = used.length ? `<div class="sources"><b>Live database</b>${used.map(tool => `<span>${esc(String(tool.tool).replace(/_/g, ' '))}${tool.ok === false ? ' · unavailable' : ''}</span>`).join('')}</div>` : '';
+            body.innerHTML += `<div class="msg ai">${formatText(x.message)}<small>${esc(x.agent)} · ${esc(x.provider || 'LLM')} · ${esc(x.risk)}</small>${(x.sources || []).length ? `<div class="sources"><b>RAG sources</b>${x.sources.map(source => `<span>[${source.source_no}] ${esc(source.filename)} · chunk ${source.chunk} · ${Math.round(source.score * 100)}%</span>`).join('')}</div>` : ''}${dbTrace}${x.ticket_no ? `<button class="secondary" onclick="go('tickets')">Open ${esc(x.ticket_no)}</button>` : ''}</div>`;
+            if (x.risk === 'critical') toast('Human escalation opened');
+        }
+    } catch (e) {
+        document.getElementById('typing')?.remove();
+        toast('Unable to start handoff. Please try again.');
+    }
+    body.scrollTop = body.scrollHeight;
+}
 function formatText(s) { return esc(s).replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>') }
 async function contactRep(mid) { try { const x = await api('/contact-rep/' + mid, { method: 'POST' }); humanConversationId = x.conversation_id; toast(`Connected to ${x.representative.name}`); go('human') } catch (e) { toast(e.message) } }
 async function startCompanyConversation(companyId) {
@@ -248,51 +274,139 @@ async function startCompanyConversation(companyId) {
             body: JSON.stringify({ company_id: companyId })
         });
         humanConversationId = x.id || x.conversation_id;
-        toast('Connected to company sales team');
+        toast(`Connected · ${x.ticket?.ticket_no || 'support ticket opened'}`);
         go('human');
+    } catch (e) {
+        toast(e.message.includes('unavailable') ? 'No sales representative is currently available for this company.' : 'Unable to start this conversation. Please try again.');
+    }
+}
+function filterDoctorCompanies() {
+    const query = document.getElementById('companySearch')?.value.trim().toLowerCase() || '';
+    document.querySelectorAll('#humanCompanyResults [data-company-name]').forEach(card => {
+        card.hidden = !card.dataset.companyName.includes(query);
+    });
+}
+async function openTicketConversation(conversationId) {
+    if (!conversationId) return;
+    humanConversationId = conversationId;
+    go('human');
+}
+async function updateHumanTicket(ticketId, status) {
+    try {
+        await api('/tickets/' + ticketId, { method: 'PATCH', body: JSON.stringify({ status }) });
+        toast('Support ticket updated');
+        if (page === 'human' && humanConversationId) await openHuman(humanConversationId);
+        else loadPage();
     } catch (e) {
         toast(e.message);
     }
 }
 async function human(el) {
     if (role === 'doctor') {
-        const [companies, chats] = await Promise.all([
+        const [companyResult, chatResult] = await Promise.allSettled([
             api('/doctor/pharma-companies'),
             api('/human-conversations')
         ]);
-        const companyCards = companies.length ? companies.map(company => `
-            <div class="card" style="padding: 16px; margin-bottom: 12px; border: 1px solid rgba(255,255,255,0.08);">
-                <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start;">
-                    <div>
-                        <b>${esc(company.company_name || company.company || 'Pharma company')}</b>
-                        <div style="color:var(--muted); font-size:12px; margin-top:4px;">${esc(company.location || 'Location unavailable')}</div>
-                    </div>
-                    <span class="tag">${company.available_contact ? 'Available' : 'Busy'}</span>
-                </div>
-                <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap; color:var(--muted); font-size:12px;">
-                    <span>${company.products_count ?? 0} products</span>
-                    <span>${company.reps_count ?? 0} reps</span>
-                    <span>${esc(company.support_phone || 'No phone')}</span>
-                </div>
-                <div style="margin-top:14px; display:flex; justify-content:flex-end;">
-                    <button class="primary small" type="button" onclick="startCompanyConversation(${company.company_id})">${company.available_contact ? 'Start chat' : 'Request callback'}</button>
-                </div>
-            </div>
-        `).join('') : '<div class="empty">No verified pharma companies are available right now.</div>';
-        const chatList = chats.length ? chats.map(c => `<button class="chat-item ${humanConversationId === c.id ? 'active' : ''}" onclick="openHuman(${c.id})"><b>${esc(c.company || c.doctor || 'Company')}</b><span>${esc(c.medicine || 'Product conversation')}</span><small>${esc(c.representative || 'Representative')}</small></button>`).join('') : '<div class="empty">No company conversations yet.</div>';
-        el.innerHTML = hero('HUMAN COMPANY SUPPORT', 'Talk to a real sales representative', 'Choose a vetted pharma company, then start a live handoff to the right sales representative. Existing chat threads stay attached to the same company.', '<span class="tag">' + companies.length + ' COMPANIES</span>') + `<div class="human-layout"><div class="card chat-list"><div class="head"><h3>Available companies</h3><span class="tag">${companies.length} live</span></div>${companyCards}</div><div class="card chat" id="humanPanel">${chatList && chats.length ? `<div class="empty">Select an active conversation to continue.</div>` : '<div class="empty">Select a company to start a live sales chat.</div>'}</div></div>`;
+        const companies = companyResult.status === 'fulfilled' ? companyResult.value : [];
+        const chats = chatResult.status === 'fulfilled' ? chatResult.value : [];
+        const chatList = chats.length ? chats.map(c => `<button class="chat-item ${humanConversationId === c.id ? 'active' : ''}" onclick="openHuman(${c.id})"><b>${esc(c.company || 'Pharmaceutical company')}</b><span>${esc(c.medicine || 'Company conversation')}</span><small>${esc(c.representative || 'Sales representative')} · ${esc(c.ticket_no || 'Ticket pending')} · ${esc(c.ticket_status || c.status || 'Open')}</small></button>`).join('') : '<div class="empty">No conversations yet. Choose a pharmaceutical company below to start human support.</div>';
+        const companyCards = companies.length ? companies.map(company => {
+            const companyName = company.company_name || company.company || 'Pharma company';
+            const approved = ['approved', 'verified'].includes(String(company.verification_status || '').toLowerCase());
+            return `<div class="company-option" data-company-name="${esc(companyName.toLowerCase())}" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px;margin-bottom:9px;border:1px solid var(--line);border-radius:10px;background:#fff"><div><b>${esc(companyName)}</b><span style="display:block;margin-top:5px;color:var(--forest);font-size:10px;font-weight:700">${approved ? '✓ Verified' : 'Demo account'}</span><small style="display:block;margin-top:4px;color:var(--muted)">${company.available_contact ? 'Sales support available' : 'No sales representative currently available'}</small><small style="display:block;margin-top:3px;color:var(--muted)">${company.products_count ?? 0} products</small></div><button class="primary small" type="button" ${company.available_contact ? '' : 'disabled'} onclick="startCompanyConversation(${company.company_id})">Chat</button></div>`;
+        }).join('') : companyResult.status === 'rejected' ? '<div class="empty">Unable to load pharmaceutical companies. Please try again.</div>' : '<div class="empty">No verified pharmaceutical companies are available right now.</div>';
+        const companyError = companyResult.status === 'rejected' ? '<button class="secondary small" onclick="loadPage()">Retry</button>' : '';
+        el.innerHTML = hero('HUMAN COMPANY SUPPORT', 'Talk to a real sales representative', 'Choose an approved pharmaceutical company to open a secure human conversation with its sales team.', '<span class="tag">' + companies.length + ' COMPANIES</span>') + `<div class="human-layout"><div class="card chat-list"><div class="head"><h3>My company conversations</h3><span class="tag">${chats.length} chats</span></div>${chatResult.status === 'rejected' ? '<div class="empty">Unable to load conversations. Please try again.</div>' : chatList}<div class="head company-list-head"><h3>Pharmaceutical companies</h3>${companyError}</div><div class="field company-search"><input id="companySearch" type="search" placeholder="Search companies..." oninput="filterDoctorCompanies()" aria-label="Search pharmaceutical companies"></div><div id="humanCompanyResults">${companyCards}</div></div><div class="card chat" id="humanPanel"><div class="empty">Select a company or conversation to open human support.</div></div></div>`;
         if (humanConversationId) openHuman(humanConversationId);
         return;
     }
     const cs = await api('/human-conversations');
-    el.innerHTML = hero(role === 'doctor' ? 'HUMAN COMPANY SUPPORT' : 'DOCTOR CONVERSATIONS', role === 'doctor' ? 'Talk to a real sales representative' : 'Real doctor conversations', 'This is a human-to-human channel. AI can route and preserve context, but the response comes from the representative. Company owners retain the sales history.', '<span class="tag">' + cs.length + ' CHATS</span>') + `<div class="human-layout"><div class="card chat-list">${cs.length ? cs.map(c => `<button class="chat-item ${humanConversationId === c.id ? 'active' : ''}" onclick="openHuman(${c.id})"><b>${esc(role === 'doctor' ? c.company : c.doctor)}</b><span>${esc(c.medicine || 'Product conversation')}</span><small>${esc(role === 'doctor' ? c.representative || 'Representative' : c.representative || 'Sales team')}</small></button>`).join('') : '<div class="empty">No human conversations yet.</div>'}</div><div class="card chat" id="humanPanel"><div class="empty">Select a conversation to open the secure human chat.</div></div></div>`; if (humanConversationId) openHuman(humanConversationId) }
-async function openHuman(cid) { humanConversationId = cid; const x = await api('/human-conversations/' + cid), p = document.getElementById('humanPanel'); if (!p) return; const c = x.conversation; p.innerHTML = `<div class="agent-head"><div class="agent-id"><div class="orb">◌</div><div><b>${esc(role === 'doctor' ? c.company_user_id ? 'Company representative' : 'Human support' : c.doctor_id ? 'Doctor' : 'Human support')}</b><span>${esc(c.medicine_id ? 'Medicine conversation' : 'Support conversation')}</span></div></div><span class="online">● HUMAN</span></div><div class="chatbody" id="humanBody">${x.messages.map(m => `<div class="msg ${m.sender === 'human' && m.agent === me.name ? 'user' : 'ai'}">${formatText(m.content)}<small>${esc(m.agent || m.sender)} · ${esc(m.created_at || '')}</small></div>`).join('')}</div><div class="chatbar"><input id="humanInput" placeholder="Write to the real person…" onkeydown="if(event.key==='Enter')sendHuman()"><button onclick="sendHuman()">↑</button></div>`; document.getElementById('humanBody').scrollTop = 999999 }
-async function sendHuman() { const i = document.getElementById('humanInput'); if (!i?.value.trim()) return; const content = i.value.trim(); i.value = ''; try { await api('/human-conversations/' + humanConversationId + '/messages', { method: 'POST', body: JSON.stringify({ content }) }); openHuman(humanConversationId) } catch (e) { toast(e.message) } }
+    const list = cs.length ? cs.map(c => `<button class="chat-item ${humanConversationId === c.id ? 'active' : ''}" data-conversation-id="${c.id}" onclick="openHuman(${c.id})"><b>${esc(c.company || c.doctor || 'Company')}</b><span>${esc(c.medicine || 'Company conversation')}</span><small>${esc(c.representative || 'Sales representative')} · ${esc(c.ticket_no || 'Ticket pending')} · ${esc(c.ticket_status || 'Open')}</small></button>`).join('') : '<div class="empty">No human conversations yet.</div>';
+    el.innerHTML = hero('DOCTOR CONVERSATIONS', 'Human sales support', 'Private human-to-human conversations with company sales representatives.', '<span class="tag">' + cs.length + ' CHATS</span>') + `<div class="human-layout"><div class="card chat-list"><div class="head"><h3>${role === 'pharma' ? 'Incoming support' : 'My support conversations'}</h3><span class="tag">${cs.length}</span></div>${list}</div><div class="card chat" id="humanPanel"><div class="empty">Select a conversation to open the secure human chat.</div></div></div>`;
+    if (humanConversationId) openHuman(humanConversationId);
+}
+function humanMessageMarkup(messages) {
+    return messages.map(m => {
+        const ownMessage = Number(m.sender_id) === Number(me.id) || (!m.sender_id && m.agent === me.name);
+        const sender = m.agent || m.sender || 'Participant';
+        return `<div class="msg ${ownMessage ? 'user' : 'ai'}">${formatText(m.content || m.message || '')}<small>${esc(sender)} · ${esc(m.created_at || '')}</small></div>`;
+    }).join('');
+}
+async function openHuman(cid) {
+    humanConversationId = cid;
+    try {
+        const x = await api('/human-conversations/' + cid);
+        const p = document.getElementById('humanPanel');
+        if (!p) return;
+        const c = x.conversation, ticket = x.ticket;
+        const status = ticket?.status || 'Open';
+        const statusOptions = ['Open', 'In Progress', 'Waiting for Doctor', 'Waiting for Company', 'Resolved', 'Reopened', 'Closed'];
+        const statusControl = !ticket ? '' : role === 'doctor'
+            ? status === 'Resolved' || status === 'Closed'
+                ? `<button class="secondary small" onclick="updateHumanTicket(${ticket.id},'Reopened')">Reopen ticket</button>`
+                : `<button class="secondary small" onclick="updateHumanTicket(${ticket.id},'Resolved')">Mark as resolved</button>`
+            : `<select aria-label="Update support ticket status" onchange="updateHumanTicket(${ticket.id},this.value)">${statusOptions.map(option => `<option value="${option}" ${option.toLowerCase() === status.toLowerCase() ? 'selected' : ''}>${option}</option>`).join('')}</select>`;
+        const timeline = (x.ticket_events || []).map(event => `<span>${esc(event.event_type.replace(/_/g, ' '))}${event.new_status ? ` · ${esc(event.new_status)}` : ''}${event.actor_name ? ` · ${esc(event.actor_name)}` : ''}</span>`).join('');
+        p.innerHTML = `<div class="agent-head"><div class="agent-id"><div class="orb">◌</div><div><b>${esc(c.company_name || 'Pharmaceutical company')}</b><span>${esc(c.representative_name || 'Sales representative')} · Sales Representative</span></div></div><span class="online">● HUMAN</span></div><div class="human-ticket-summary" id="humanTicketSummary" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 14px;border-bottom:1px solid var(--line);background:#f8faf5;font-size:11px">${ticket ? `<b>Support Ticket: ${esc(ticket.ticket_no)}</b><span>Status: <strong id="humanTicketStatus">${esc(status)}</strong></span><div class="human-ticket-actions">${statusControl}</div>${timeline ? `<div class="human-ticket-events" style="flex-basis:100%;display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:10px">${timeline}</div>` : ''}` : '<span>No linked support ticket.</span>'}</div><div class="chatbody" id="humanBody">${humanMessageMarkup(x.messages || [])}</div><div class="chatbar"><input id="humanInput" placeholder="Write a message…" onkeydown="if(event.key==='Enter')sendHuman()"><button aria-label="Send message" onclick="sendHuman()">↑</button></div>`;
+        document.getElementById('humanBody').scrollTop = 999999;
+        clearInterval(humanRefreshTimer);
+        humanRefreshTimer = setInterval(refreshHumanConversation, 5000);
+    } catch (e) {
+        toast('Unable to load this conversation. Please try again.');
+    }
+}
+async function refreshHumanConversation() {
+    if (page !== 'human' || !humanConversationId) return;
+    try {
+        const [detail, conversations] = await Promise.all([
+            api('/human-conversations/' + humanConversationId),
+            api('/human-conversations')
+        ]);
+        const body = document.getElementById('humanBody');
+        if (body) body.innerHTML = humanMessageMarkup(detail.messages || []);
+        const status = document.getElementById('humanTicketStatus');
+        if (status && detail.ticket) status.textContent = detail.ticket.status;
+        conversations.forEach(conversation => {
+            const entry = document.querySelector(`[data-conversation-id="${conversation.id}"] small`);
+            if (entry) entry.textContent = `${conversation.representative || 'Sales representative'} · ${conversation.ticket_no || 'Ticket pending'} · ${conversation.ticket_status || 'Open'}`;
+        });
+    } catch (_) {
+        // Polling is best-effort; the next interval retries without interrupting message entry.
+    }
+}
+async function sendHuman() {
+    const input = document.getElementById('humanInput');
+    if (!input?.value.trim() || !humanConversationId) return;
+    const content = input.value.trim();
+    input.disabled = true;
+    try {
+        await api('/human-conversations/' + humanConversationId + '/messages', { method: 'POST', body: JSON.stringify({ content }) });
+        input.value = '';
+        await openHuman(humanConversationId);
+    } catch (e) {
+        toast('Message failed. Please retry.');
+    } finally {
+        if (document.getElementById('humanInput')) document.getElementById('humanInput').disabled = false;
+    }
+}
 function orderStatusBadge(status) { return `<span class="tag">${esc(status || 'Pending')}</span>` }
 
 async function orders(el) { const os = await api('/orders'); if (role === 'doctor') { el.innerHTML = hero('TRANSACTION WORKFLOW', 'My Orders', 'Track your medicine requests from submission to review, assignment and fulfillment.', '<span class="tag">' + os.length + ' RECORDS</span>') + `<div class="card table-card"><div class="table-wrap"><table><thead><tr><th>Order ID</th><th>Medicine</th><th>Company</th><th>Representative</th><th>Requested Date</th><th>Status</th></tr></thead><tbody>${os.map(o => `<tr><td><button class="link" onclick="openOrderDetails(${o.id})">${esc(o.order_no)}</button></td><td>${esc(o.medicine)}</td><td>${esc(o.company || '—')}</td><td>${esc(o.representative || '—')}</td><td>${esc(o.requested_date || '—')}</td><td>${orderStatusBadge(o.status)}</td></tr>`).join('')}</tbody></table></div></div>`; return; }
     el.innerHTML = hero('TRANSACTION WORKFLOW', 'Orders', 'Product requests are stored against the company product and visible to the correct pharmaceutical workspace.', '<span class="tag">' + os.length + ' RECORDS</span>') + `<div class="card table-card"><div class="table-wrap"><table><thead><tr><th>Order</th><th>Medicine</th><th>Doctor</th><th>Quantity</th><th>Requested</th><th>Representative</th><th>Status</th><th>Action</th></tr></thead><tbody>${os.map(o => `<tr><td><button class="link" onclick="openOrderDetails(${o.id})">${esc(o.order_no)}</button></td><td>${esc(o.medicine)}</td><td>${esc(o.doctor || me.name)}</td><td>${o.quantity}</td><td>${esc(o.requested_date || '—')}</td><td>${esc(o.representative || 'Unassigned')}</td><td>${orderStatusBadge(o.status)}</td><td><button class="secondary small" onclick="openUpdateOrderStatusModal(${o.id})">Update Status</button></td></tr>`).join('')}</tbody></table></div></div>` }
-async function tickets(el) { const ts = await api('/tickets'); el.innerHTML = hero('SAFETY + EXPERT REVIEW', 'Human Escalations', 'Critical questions are blocked from autonomous answers and preserved for qualified human review.', '<span class="tag">' + ts.length + ' CASES</span>') + `<div class="card table-card"><div class="table-wrap"><table><thead><tr><th>Ticket</th><th>Doctor</th><th>Department</th><th>Priority</th><th>Status</th></tr></thead><tbody>${ts.map(t => `<tr><td><b>${esc(t.ticket_no)}</b><span style="display:block;color:var(--muted)">${esc(t.subject)}</span></td><td>${esc(t.doctor)}</td><td>${esc(t.department)}</td><td><span class="pill">${esc(t.priority)}</span></td><td>${role === 'pharma' ? `<select onchange="updateTicket(${t.id},this.value)"><option>${esc(t.status)}</option><option>In Review</option><option>Resolved</option></select>` : `<span class="tag">${esc(t.status)}</span>`}</td></tr>`).join('')}</tbody></table></div></div>` }
+async function tickets(el) {
+    const ts = await api('/tickets');
+    const statusChoices = ['Open', 'In Progress', 'Waiting for Doctor', 'Waiting for Company', 'Resolved', 'Reopened', 'Closed'];
+    el.innerHTML = hero(role === 'doctor' ? 'HUMAN SUPPORT' : 'HUMAN SUPPORT', role === 'sales_rep' ? 'My Support Tickets' : role === 'pharma' ? 'Incoming Human Support' : 'Human Support', 'One ticket record is shared by the doctor, selected company, and assigned representative.', '<span class="tag">' + ts.length + ' CASES</span>') + `<div class="card table-card"><div class="table-wrap"><table><thead><tr><th>Ticket</th><th>Doctor</th><th>Company</th><th>Medicine</th><th>Assigned representative</th><th>Status</th><th>Conversation</th></tr></thead><tbody>${ts.map(t => {
+        const humanTicket = Boolean(t.conversation_id);
+        const statusCell = humanTicket && role === 'doctor'
+            ? `<span class="tag">${esc(t.status)}</span>${t.status === 'Resolved' || t.status === 'Closed' ? `<button class="link" onclick="updateHumanTicket(${t.id},'Reopened')">Reopen</button>` : `<button class="link" onclick="updateHumanTicket(${t.id},'Resolved')">Mark resolved</button>`}`
+            : humanTicket
+                ? `<select aria-label="Update ${esc(t.ticket_no)} status" onchange="updateHumanTicket(${t.id},this.value)">${statusChoices.map(status => `<option value="${status}" ${status.toLowerCase() === String(t.status).toLowerCase() ? 'selected' : ''}>${status}</option>`).join('')}</select>`
+                : role === 'pharma' ? `<select onchange="updateTicket(${t.id},this.value)"><option>${esc(t.status)}</option><option>In Review</option><option>Resolved</option></select>` : `<span class="tag">${esc(t.status)}</span>`;
+        const timeline = (t.events || []).map(event => `<div>${esc(event.event_type.replace(/_/g, ' '))}${event.new_status ? ` · ${esc(event.new_status)}` : ''}${event.actor_name ? ` · ${esc(event.actor_name)}` : ''}</div>`).join('');
+        return `<tr><td><b>${esc(t.ticket_no)}</b><span style="display:block;color:var(--muted)">${esc(t.subject)}</span>${timeline ? `<details><summary>Timeline</summary>${timeline}</details>` : ''}</td><td>${esc(t.doctor || '—')}</td><td>${esc(t.company || '—')}</td><td>${esc(t.medicine || '—')}</td><td>${esc(t.representative || 'Unassigned')}</td><td>${statusCell}</td><td>${humanTicket ? `<button class="secondary small" onclick="openTicketConversation(${t.conversation_id})">Open chat</button>` : '—'}</td></tr>`;
+    }).join('')}</tbody></table></div></div>`;
+}
 async function updateTicket(id, status) { try { await api('/tickets/' + id, { method: 'PATCH', body: JSON.stringify({ status }) }); toast('Updated') } catch (e) { toast(e.message) } }
 async function profile(el) { const p = await api('/profile'); el.innerHTML = hero('IDENTITY + VERIFICATION', 'My Profile', 'Keep your professional identity and verification data current. For Pakistan demo verification, PM&DC is the reference registry; production automation requires an authorized integration.', '<span class="tag">' + esc(p.verification_status || 'pending') + '</span>') + `<div class="grid two"><div class="card"><div class="head"><h3>Identity</h3></div><div class="field"><label>Name</label><input id="pname" value="${esc(p.name)}" disabled></div><div class="field"><label>Email</label><input value="${esc(p.email)}" disabled></div><div class="field"><label>Phone</label><input id="pphone" value="${esc(p.phone || '')}"></div><div class="field"><label>Address</label><input id="paddress" value="${esc(p.address || '')}"></div></div><div class="card"><div class="head"><h3>Professional credentials</h3><span class="pill">${esc(p.verification_status)}</span></div>${p.role === 'doctor' ? `<div class="field"><label>Specialization</label><input id="pspec" value="${esc(p.specialization || '')}"></div><div class="field"><label>PM&DC license number</label><input id="plicense" value="${esc(p.license_number || '')}"></div><div class="field"><label>Authority</label><input id="pauth" value="${esc(p.registration_authority || 'PM&DC')}"></div><div class="note-box">Official registry reference: <a href="${p.verification_url}" target="_blank">PM&DC practitioner register ↗</a><br><small>Our demo uses an owner-verification adapter. Do not claim automatic government verification unless the regulator provides an authorized API/integration.</small></div>` : '<div class="note-box">Company verification credentials are managed by the owner admin. Your company can upload supporting documents through the Knowledge Center.</div>'}<button class="primary" onclick="saveProfile()">Save profile</button></div></div>` }
 async function saveProfile() { try { const x = await api('/profile', { method: 'PATCH', body: JSON.stringify({ specialization: document.getElementById('pspec')?.value, phone: document.getElementById('pphone')?.value, address: document.getElementById('paddress')?.value, license_number: document.getElementById('plicense')?.value, registration_authority: document.getElementById('pauth')?.value }) }); me = x; localStorage.setItem('pharmaai_user', JSON.stringify(me)); toast('Profile updated') } catch (e) { toast(e.message) } }
