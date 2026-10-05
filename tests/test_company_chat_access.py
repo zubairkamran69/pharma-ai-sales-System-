@@ -147,6 +147,123 @@ def test_company_chat_access_matrix_is_enforced():
         cleanup_temp_db(db_path)
 
 
+def test_company_21_chat_notifies_reps_and_allows_one_atomic_claim():
+    db_path = setup_temp_db()
+    try:
+        seed_company_chat_data(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO users(id,name,email,password,role,company,created_at,verification_status,company_user_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (21, 'Company 21', 'company.21@test.local', 'unused', 'pharma', 'Company 21', main.now(), 'approved', 21),
+            )
+            for index in range(50):
+                conn.execute(
+                    "INSERT INTO users(name,email,password,role,company,created_at,verification_status,company_user_id) VALUES(?,?,?,?,?,?,?,?)",
+                    (f'Rep 21-{index}', f'rep.21.{index}@test.local', 'unused', 'sales_rep', 'Company 21', main.now(), 'approved', 21),
+                )
+            rep_ids = [row[0] for row in conn.execute("SELECT id FROM users WHERE role='sales_rep' AND company_user_id=21 ORDER BY id")]
+
+        sqlite_db = main.db
+
+        class PostgresStatementGuard:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, sql, params=None):
+                if sql.lstrip().startswith('UPDATE conversations SET company_id=?, company_user_id=?'):
+                    assert "status=COALESCE(status, 'open')" in sql
+                if params is None:
+                    return self.connection.execute(sql)
+                return self.connection.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        main.db = lambda: PostgresStatementGuard(sqlite_db())
+        with TestClient(main.app) as client:
+            doctor_token = main.token({'id': 1, 'role': 'doctor'})
+            headers = {'Authorization': f'Bearer {doctor_token}'}
+            invalid_company = client.post('/api/conversations', headers=headers, json={'company_id': '21'})
+            assert invalid_company.status_code == 400
+            missing_company = client.post('/api/conversations', headers=headers, json={'company_id': 999})
+            assert missing_company.status_code == 404
+
+            created = client.post('/api/conversations', headers=headers, json={'company_id': 21})
+            assert created.status_code == 200, created.text
+            conversation = created.json()
+            assert conversation['doctor_id'] == 1
+            assert conversation['company_id'] == 21
+            assert conversation['sales_representative_id'] is None
+            assert conversation['status'] == 'open'
+            assert conversation['ticket']['sales_representative_id'] is None
+
+            repeated = client.post('/api/conversations', headers=headers, json={'company_id': 21})
+            assert repeated.status_code == 200, repeated.text
+            assert repeated.json()['id'] == conversation['id']
+            with sqlite3.connect(db_path) as conn:
+                notified_reps = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT user_id FROM notifications WHERE type='human_chat' AND title='New Doctor Support Request'"
+                    )
+                }
+            assert notified_reps == set(rep_ids) | {21}
+
+            first_rep_token = main.token({'id': rep_ids[0], 'role': 'sales_rep', 'company_user_id': 21})
+            second_rep_token = main.token({'id': rep_ids[1], 'role': 'sales_rep', 'company_user_id': 21})
+            claimed = client.post(
+                f'/api/human-conversations/{conversation["id"]}/claim',
+                headers={'Authorization': f'Bearer {first_rep_token}'},
+            )
+            assert claimed.status_code == 200, claimed.text
+            assert claimed.json()['sales_representative_id'] == rep_ids[0]
+            competing_claim = client.post(
+                f'/api/human-conversations/{conversation["id"]}/claim',
+                headers={'Authorization': f'Bearer {second_rep_token}'},
+            )
+            assert competing_claim.status_code == 409
+
+            assigned_notifications = client.get(
+                '/api/notifications',
+                headers={'Authorization': f'Bearer {second_rep_token}'},
+            ).json()
+            assert any(item['type'] == 'human_chat_assigned' for item in assigned_notifications)
+
+            sent = client.post(
+                f'/api/human-conversations/{conversation["id"]}/messages',
+                headers=headers,
+                json={'content': 'Please share the approved company information.'},
+            )
+            assert sent.status_code == 200, sent.text
+            rep_detail = client.get(
+                f'/api/human-conversations/{conversation["id"]}',
+                headers={'Authorization': f'Bearer {first_rep_token}'},
+            )
+            assert rep_detail.status_code == 200, rep_detail.text
+            assert rep_detail.json()['messages'][0]['content'] == 'Please share the approved company information.'
+
+            reply = client.post(
+                f'/api/human-conversations/{conversation["id"]}/messages',
+                headers={'Authorization': f'Bearer {first_rep_token}'},
+                json={'content': 'I will follow up with approved materials.'},
+            )
+            assert reply.status_code == 200, reply.text
+            doctor_detail = client.get(
+                f'/api/human-conversations/{conversation["id"]}',
+                headers=headers,
+            )
+            assert [message['content'] for message in doctor_detail.json()['messages']] == [
+                'Please share the approved company information.',
+                'I will follow up with approved materials.',
+            ]
+            assert conversation['id'] in {
+                item['id']
+                for item in client.get('/api/conversations', headers=headers).json()
+            }
+    finally:
+        cleanup_temp_db(db_path)
+
+
 def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
     db_path = setup_temp_db()
     try:
@@ -321,7 +438,10 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
             company_b_ticket = company_b_start.json()['ticket']
             assert company_b_start.json()['company_id'] == 102
             assert company_b_ticket['sales_representative_id'] is None
-            assert {item['ticket_no'] for item in client.get('/api/tickets', headers={'Authorization': f'Bearer {company_a_token}'}).json()} == {ticket['ticket_no']}
+            assert {item['ticket_no'] for item in client.get('/api/tickets', headers={'Authorization': f'Bearer {company_a_token}'}).json()} == {
+                ticket['ticket_no'],
+                new_company_a_chat.json()['ticket_no'],
+            }
             assert {item['ticket_no'] for item in client.get('/api/tickets', headers={'Authorization': f'Bearer {company_b_token}'}).json()} == {company_b_ticket['ticket_no']}
             company_b_claim = client.post(f'/api/human-conversations/{company_b_start.json()["id"]}/claim', headers={'Authorization': f'Bearer {rep_b_token}'})
             assert company_b_claim.status_code == 200, company_b_claim.text

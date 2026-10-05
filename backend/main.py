@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Body
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -3068,22 +3068,39 @@ def pharma_company_detail(company_id: int, authorization: str | None = Header(de
     c.close(); return company_row
 
 
+def _doctor_conversation_resources(authorization: str | None = Header(default=None)):
+    doctor = guard('doctor')(authorization)
+    connection = db()
+    try:
+        yield doctor, connection
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 @app.post('/api/conversations')
-def create_or_get_conversation(payload: dict | None = Body(default=None), authorization: str | None = Header(default=None)):
-    u = auth(authorization)
-    if u['role'] != 'doctor':
-        raise HTTPException(403, 'Only doctors can start a company conversation')
+def create_or_get_conversation(
+    payload: dict | None = Body(default=None),
+    resources: Any = Depends(_doctor_conversation_resources),
+):
+    u, c = resources
     data = dict(payload or {})
     company_id = data.get('company_id')
     medicine_id = data.get('medicine_id')
     issue = str(data.get('issue') or '').strip()
     agent_conversation_id = data.get('agent_conversation_id')
-    if not company_id:
+    if company_id is None:
         raise HTTPException(400, 'company_id is required')
-    c = db()
+    if isinstance(company_id, bool) or not isinstance(company_id, int) or company_id <= 0:
+        raise HTTPException(400, 'company_id must be a positive integer')
+    for field, value in (('medicine_id', medicine_id), ('agent_conversation_id', agent_conversation_id)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            raise HTTPException(400, f'{field} must be a positive integer')
     company = c.execute("SELECT * FROM users WHERE role='pharma' AND (id=? OR company_user_id=?) AND verification_status IN ('approved','verified','demo') ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END,id LIMIT 1", (company_id, company_id, company_id)).fetchone()
     if not company:
-        c.close(); raise HTTPException(404, 'Company not found or unavailable for chat')
+        raise HTTPException(404, 'Company not found or unavailable for chat')
     company_row = row(company)
     company_scope_id = company_row.get('company_user_id') or company_row['id']
     company_ids = (company_row['id'], company_scope_id)
@@ -3107,7 +3124,7 @@ def create_or_get_conversation(payload: dict | None = Body(default=None), author
             (medicine_id, *company_ids),
         ).fetchone()
         if not medicine:
-            c.close(); raise HTTPException(400, 'The selected medicine does not belong to this company')
+            raise HTTPException(400, 'The selected medicine does not belong to this company')
     source_agent = None
     source_issue_recorded = False
     if agent_conversation_id is not None:
@@ -3116,7 +3133,7 @@ def create_or_get_conversation(payload: dict | None = Body(default=None), author
             (agent_conversation_id, u['id']),
         ).fetchone()
         if not source_agent:
-            c.close(); raise HTTPException(404, 'The AI conversation was not found for this doctor')
+            raise HTTPException(404, 'The AI conversation was not found for this doctor')
         source_issue_recorded = bool(c.execute(
             "SELECT id FROM messages WHERE conversation_id=? AND sender='user' AND content=? LIMIT 1",
             (agent_conversation_id, issue),
@@ -3161,7 +3178,7 @@ def create_or_get_conversation(payload: dict | None = Body(default=None), author
             """,
             (u['id'], 'doctor', 'human', u['id'], company_scope_id, company_scope_id, None, None, medicine_id, 'open', conv_ts, conv_ts, conv_ts, None),
         ).lastrowid
-    c.execute('UPDATE conversations SET company_id=?, company_user_id=?, sales_representative_id=COALESCE(sales_representative_id, sales_rep_id), status=COALESCE(status, "open"), updated_at=?, last_message_at=COALESCE(last_message_at, ?) WHERE id=?', (company_scope_id, company_scope_id, now(), now(), cid))
+    c.execute("UPDATE conversations SET company_id=?, company_user_id=?, sales_representative_id=COALESCE(sales_representative_id, sales_rep_id), status=COALESCE(status, 'open'), updated_at=?, last_message_at=COALESCE(last_message_at, ?) WHERE id=?", (company_scope_id, company_scope_id, now(), now(), cid))
     conv_row = c.execute('SELECT * FROM conversations WHERE id=?', (cid,)).fetchone()
     if source_agent and existing:
         c.execute(
@@ -3249,14 +3266,14 @@ def create_or_get_conversation(payload: dict | None = Body(default=None), author
             'INSERT INTO messages(conversation_id,sender,sender_id,sender_role,agent,message,content,risk,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
             (cid, 'human', u['id'], 'doctor', u['name'], issue, issue, 'human', sent_at),
         )
-    c.commit();
     conv_row = c.execute('SELECT * FROM conversations WHERE id=?', (cid,)).fetchone()
     result = row(conv_row)
     result['ticket'] = ticket
     result['ticket_id'] = ticket['id']
     result['ticket_no'] = ticket['ticket_no']
     result['ticket_status'] = ticket['status']
-    c.close(); return result
+    c.commit()
+    return result
 
 
 @app.get('/api/conversations')
