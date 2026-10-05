@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-import hashlib, secrets, os, jwt, datetime, json, re, urllib.request, uuid, math
+import hashlib, secrets, os, jwt, datetime, json, re, urllib.request, uuid, math, sqlite3
 import logging
 import sys
 from typing import Any, Dict
@@ -25,6 +25,17 @@ from rag_engine import MedicineRAG, LLMClient
 import medical_router
 
 DEFAULT_LOCAL_JWT_SECRET = 'local-dev-pharmaai-jwt-secret-change-me-please'
+DEFAULT_LOCAL_DATABASE_PATH = PROJECT_ROOT / 'backend' / 'pharmaai_local.db'
+
+
+def resolve_database_url():
+    configured = (os.getenv('DATABASE_URL') or '').strip()
+    if configured:
+        return configured
+    DEFAULT_LOCAL_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger('pharmaai.app')
+    logger.warning('DATABASE_URL was not set; using a local SQLite database for development only at %s.', DEFAULT_LOCAL_DATABASE_PATH)
+    return f'sqlite:///{DEFAULT_LOCAL_DATABASE_PATH.as_posix()}'
 
 
 def resolve_backend_secret():
@@ -37,7 +48,7 @@ def resolve_backend_secret():
 
 
 BASE=os.path.dirname(__file__)
-DATABASE_URL = os.getenv('DATABASE_URL') or None
+DATABASE_URL = resolve_database_url()
 SECRET = resolve_backend_secret()
 DB_INTEGRITY_ERRORS = (psycopg2.IntegrityError,) if psycopg2 is not None else ()
 _configured_db_integrity_errors = DB_INTEGRITY_ERRORS
@@ -140,6 +151,19 @@ class PostgresCompatConnection:
 def db():
     if not DATABASE_URL:
         raise RuntimeError('DATABASE_URL is required. Configure Neon PostgreSQL in the backend environment.')
+
+    if str(DATABASE_URL).startswith('sqlite'):
+        sqlite_path = str(DATABASE_URL)
+        if sqlite_path.startswith('sqlite:///'):
+            sqlite_path = sqlite_path.replace('sqlite:///', '', 1)
+        elif sqlite_path.startswith('sqlite://'):
+            sqlite_path = sqlite_path.replace('sqlite://', '', 1)
+        if not sqlite_path or sqlite_path == ':memory:':
+            sqlite_path = ':memory:'
+        conn = sqlite3.connect(sqlite_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
     if psycopg2 is None:
         raise RuntimeError('PostgreSQL driver is unavailable. Install backend/requirements.txt.')
     try:
@@ -1012,9 +1036,14 @@ def initialize_database():
 def health():
     try:
         c = db()
-        tables = {r['table_name'] for r in c.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema=current_schema() AND table_type='BASE TABLE'"
-        ).fetchall()}
+        if str(DATABASE_URL).startswith('sqlite'):
+            tables = {r['name'] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()}
+        else:
+            tables = {r['table_name'] for r in c.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema=current_schema() AND table_type='BASE TABLE'"
+            ).fetchall()}
         c.close()
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
@@ -2916,17 +2945,7 @@ def _create_human_ticket(c, doctor, company_id, company_name, representative_id,
     existing = c.execute('SELECT * FROM tickets WHERE conversation_id=? ORDER BY id DESC LIMIT 1', (conversation_id,)).fetchone()
     if existing:
         if str(existing['status'] or '').lower() in ('resolved', 'closed'):
-            timestamp = now()
-            content = str(issue or existing['content'] or '').strip()
-            c.execute(
-                "UPDATE tickets SET status=?,content=?,sales_representative_id=?,assigned_at=?,doctor_resolution=NULL,resolution_requested_at=NULL,resolved_at=NULL,resolved_by=NULL,closed_at=NULL,updated_at=? WHERE id=?",
-                (status, content, representative_id, timestamp if representative_id else None, timestamp, existing['id']),
-            )
-            c.execute(
-                'INSERT INTO ticket_events(ticket_id,actor_id,actor_role,event_type,old_status,new_status,created_at) VALUES(?,?,?,?,?,?,?)',
-                (existing['id'], doctor['id'], 'doctor', 'reopened', existing['status'], status, timestamp),
-            )
-            return row(c.execute('SELECT * FROM tickets WHERE id=?', (existing['id'],)).fetchone()), False
+            raise HTTPException(409, 'This support ticket is closed. Start a new company conversation.')
         return row(existing), False
 
     created_at = now()
@@ -2986,13 +3005,21 @@ def doctor_pharma_companies(authorization: str | None = Header(default=None)):
                u.phone AS support_phone,
                (SELECT COUNT(*) FROM medicines m WHERE m.owner_user_id IN (u.id,COALESCE(NULLIF(u.company_user_id,0),u.id))) AS products_count,
                (SELECT COUNT(*) FROM users rep WHERE rep.role='sales_rep' AND rep.company_user_id=COALESCE(NULLIF(u.company_user_id,0),u.id) AND rep.verification_status IN ('approved','verified','demo')) AS reps_count,
-               (SELECT COUNT(*) FROM users rep WHERE rep.role='sales_rep' AND rep.company_user_id=COALESCE(NULLIF(u.company_user_id,0),u.id) AND rep.verification_status IN ('approved','verified','demo')) > 0 AS available_contact
+               (SELECT COUNT(*) FROM users rep WHERE rep.role='sales_rep' AND rep.company_user_id=COALESCE(NULLIF(u.company_user_id,0),u.id) AND rep.verification_status IN ('approved','verified','demo')) > 0 AS available_contact,
+               (SELECT COUNT(*) FROM messages msg
+                  JOIN conversations conv ON conv.id=msg.conversation_id
+                  WHERE conv.conversation_type='human'
+                    AND conv.doctor_id=?
+                    AND (conv.company_id=COALESCE(NULLIF(u.company_user_id,0),u.id) OR conv.company_user_id=COALESCE(NULLIF(u.company_user_id,0),u.id))
+                    AND lower(COALESCE(conv.status,'open')) NOT IN ('resolved','closed')
+                    AND msg.sender_id<>?
+                    AND msg.read_at IS NULL) AS unread_count
         FROM users u
         WHERE u.role='pharma'
           AND u.verification_status IN ('approved','verified','demo')
         ORDER BY u.name ASC
     """
-    companies = rows(c.execute(q))
+    companies = rows(c.execute(q, (u['id'], u['id'])))
     c.close()
     return companies
 
@@ -3096,15 +3123,18 @@ def create_or_get_conversation(payload: dict | None = Body(default=None), author
         ).fetchone()) if issue else False
     existing = c.execute(
         """
-        SELECT id FROM conversations
-        WHERE conversation_type='human'
-          AND doctor_id=?
-                    AND (company_id IN (?,?) OR company_user_id IN (?,?))
-          AND COALESCE(medicine_id, -1)=COALESCE(?, medicine_id, -1)
-        ORDER BY id DESC
+        SELECT c.id FROM conversations c
+        LEFT JOIN tickets t ON t.conversation_id=c.id
+        WHERE c.conversation_type='human'
+          AND c.doctor_id=?
+          AND (c.company_id IN (?,?) OR c.company_user_id IN (?,?))
+          AND COALESCE(c.medicine_id, -1)=COALESCE(?, c.medicine_id, -1)
+          AND lower(COALESCE(c.status, 'open')) NOT IN ('resolved','closed')
+          AND lower(COALESCE(t.status, 'open')) NOT IN ('resolved','closed')
+        ORDER BY c.id DESC
         LIMIT 1
         """,
-            (u['id'], *company_ids, *company_ids, medicine_id),
+        (u['id'], *company_ids, *company_ids, medicine_id),
     ).fetchone()
     conversation_created = not bool(existing)
     if existing:
@@ -3498,13 +3528,13 @@ def human_conversations(authorization: str|None=Header(default=None)):
         WHERE c.conversation_type='human'
     '''
     if u['role']=='doctor':
-        q=common+' AND c.doctor_id=? ORDER BY c.id DESC'; params=(u['id'],)
+        q=common+" AND c.doctor_id=? AND lower(COALESCE(c.status,'open')) NOT IN ('resolved','closed') AND lower(COALESCE(t.status,'open')) NOT IN ('resolved','closed') ORDER BY c.id DESC"; params=(u['id'],)
     elif u['role']=='pharma':
         company_id=owner_company_id(u)
-        q=common+' AND (c.company_id=? OR c.company_user_id=? OR c.company_id IN (SELECT id FROM users WHERE role=\'pharma\' AND company_user_id=?)) ORDER BY c.id DESC'; params=(company_id,company_id,company_id)
+        q=common+" AND (c.company_id=? OR c.company_user_id=? OR c.company_id IN (SELECT id FROM users WHERE role='pharma' AND company_user_id=?)) AND lower(COALESCE(c.status,'open')) NOT IN ('resolved','closed') AND lower(COALESCE(t.status,'open')) NOT IN ('resolved','closed') ORDER BY c.id DESC"; params=(company_id,company_id,company_id)
     elif u['role']=='sales_rep':
         company_id = owner_company_id(u)
-        q=common+' AND (c.company_id=? OR c.company_user_id=? OR c.company_id IN (SELECT id FROM users WHERE role=\'pharma\' AND company_user_id=?)) ORDER BY c.id DESC'; params=(company_id,company_id,company_id)
+        q=common+" AND (c.company_id=? OR c.company_user_id=? OR c.company_id IN (SELECT id FROM users WHERE role='pharma' AND company_user_id=?)) AND lower(COALESCE(c.status,'open')) NOT IN ('resolved','closed') AND lower(COALESCE(t.status,'open')) NOT IN ('resolved','closed') ORDER BY c.id DESC"; params=(company_id,company_id,company_id)
     else:
         c.close(); raise HTTPException(403,'Permission denied')
     out=rows(c.execute(q,params)); c.close(); return out
@@ -3537,7 +3567,7 @@ def human_message(cid:int,x:HumanMessage,authorization: str|None=Header(default=
         c.close(); raise HTTPException(409,'Take this conversation before sending a message')
     ticket=c.execute('SELECT * FROM tickets WHERE conversation_id=?',(cid,)).fetchone()
     if ticket and str(ticket['status'] or '').lower() in ('resolved','closed'):
-        c.close(); raise HTTPException(409,'This support ticket is resolved. Reopen it before continuing the conversation')
+        c.close(); raise HTTPException(409,'This support ticket is closed. Start a new company conversation.')
     sent_at=now()
     c.execute('insert into messages(conversation_id,sender,sender_id,sender_role,agent,message,content,risk,created_at) values(?,?,?,?,?,?,?,?,?)',(cid,'human',u['id'],u['role'],u['name'],x.content,x.content,'human',sent_at))
     c.execute('UPDATE conversations SET updated_at=?,last_message_at=? WHERE id=?',(sent_at,sent_at,cid))
@@ -3676,46 +3706,62 @@ def update_ticket(tid:int,x:TicketUpdate,authorization: str|None=Header(default=
         notice_body = ''
         update_resolution = None
         if u['role'] == 'doctor':
-            if x.resolution_confirmation:
-                confirmation = str(x.resolution_confirmation).strip().lower()
-                if confirmation not in ('yes', 'no'):
-                    c.close(); raise HTTPException(400, 'Resolution confirmation must be yes or no')
-                if old_status != 'Pending Confirmation':
-                    c.close(); raise HTTPException(409, 'This ticket is not waiting for your resolution confirmation')
-                update_resolution = confirmation
-                new_status = 'Resolved' if confirmation == 'yes' else 'Pending'
-                event_type = 'doctor_confirmed_resolution' if confirmation == 'yes' else 'doctor_rejected_resolution'
-                notice_title = 'Doctor confirmed resolution' if confirmation == 'yes' else 'Doctor still needs help'
-                notice_body = f'{u["name"]} confirmed the issue is resolved.' if confirmation == 'yes' else f'{u["name"]} reported that the issue is not resolved. Please continue handling the conversation.'
-            elif str(x.status or '').strip().lower() == 'reopened' and old_status in ('Resolved', 'Closed'):
-                new_status = 'Reopened'
-                event_type = 'reopened'
-                notice_title = 'Support ticket reopened'
-                notice_body = f'{u["name"]} reopened the support ticket and still needs help.'
+            normalized = str(x.status or '').strip().replace('_', ' ').lower()
+            confirmation = str(x.resolution_confirmation or '').strip().lower()
+            if confirmation and confirmation not in ('yes', 'no'):
+                c.close(); raise HTTPException(400, 'Resolution confirmation must be yes or no')
+            if normalized in ('resolved', 'closed') or confirmation == 'yes':
+                new_status = 'Resolved'
+                update_resolution = 'yes'
+                event_type = 'doctor_confirmed_resolution'
+                notice_title = 'Support request resolved'
+                notice_body = f'{u["name"]} marked the support request as resolved.'
+            elif confirmation == 'no':
+                new_status = 'Pending'
+                update_resolution = 'no'
+                event_type = 'doctor_rejected_resolution'
+                notice_title = 'Doctor still needs help'
+                notice_body = f'{u["name"]} reported that the issue is not resolved. Please continue handling the conversation.'
             else:
-                c.close(); raise HTTPException(403, 'Doctors must confirm or reject a representative resolution request')
+                c.close(); raise HTTPException(403, 'Use the resolution action to close this support request')
         elif u['role'] == 'sales_rep':
             if rep_id != u['id']:
                 c.close(); raise HTTPException(403, 'Only the assigned representative can update this ticket')
             normalized = str(x.status or '').strip().replace('_', ' ').lower()
-            if normalized in ('resolved', 'pending confirmation'):
-                new_status = 'Pending Confirmation'
-                event_type = 'resolution_requested'
-                notice_title = 'Please confirm your support request is resolved'
-                notice_body = f'{u["name"]} marked your request as resolved. Is your issue resolved?'
+            if normalized in ('resolved', 'closed'):
+                new_status = 'Resolved'
+                event_type = 'resolution_completed'
+                notice_title = 'Support request resolved'
+                notice_body = f'{u["name"]} marked the support request as resolved.'
             elif normalized in ('in progress', 'pending', 'waiting for doctor'):
                 new_status = {'in progress': 'In Progress', 'pending': 'Pending', 'waiting for doctor': 'Pending'}[normalized]
                 notice_title = 'Support ticket updated'
                 notice_body = f'{u["name"]} updated your support request to {new_status}.'
             else:
-                c.close(); raise HTTPException(400, 'Representatives may continue the ticket or request doctor resolution confirmation')
+                c.close(); raise HTTPException(400, 'Representatives may continue the ticket or mark it resolved')
+        elif u['role'] == 'pharma':
+            company_id = owner_company_id(u)
+            if company_id is None or company_id not in {resolve_conversation_company(conv_row), conv_row.get('company_user_id')}:
+                c.close(); raise HTTPException(403, 'Only the owning pharmaceutical company can update this ticket')
+            normalized = str(x.status or '').strip().replace('_', ' ').lower()
+            if normalized in ('resolved', 'closed'):
+                new_status = 'Resolved'
+                event_type = 'company_resolved'
+                notice_title = 'Support request resolved by company'
+                notice_body = f'{u["name"]} marked the support request as resolved.'
+            elif normalized in ('in progress', 'pending'):
+                new_status = 'In Progress' if normalized == 'in progress' else 'Pending'
+                event_type = 'company_status_updated'
+                notice_title = 'Support ticket updated'
+                notice_body = f'{u["name"]} updated your support request to {new_status}.'
+            else:
+                c.close(); raise HTTPException(400, 'Company may continue the ticket or mark it resolved')
         else:
-            c.close(); raise HTTPException(403, 'Only the assigned representative or doctor may update this support ticket')
+            c.close(); raise HTTPException(403, 'Only the doctor, owning company, or assigned representative may update this support ticket')
 
-        if u['role'] == 'sales_rep' and new_status == 'Pending Confirmation':
-            c.execute('UPDATE tickets SET status=?,updated_at=?,resolution_requested_at=?,doctor_resolution=NULL WHERE id=?',(new_status,timestamp,timestamp,tid))
-        elif u['role'] == 'doctor' and update_resolution == 'yes':
-            c.execute('UPDATE tickets SET status=?,updated_at=?,resolved_at=?,resolved_by=?,doctor_resolution=?,closed_at=NULL WHERE id=?',(new_status,timestamp,timestamp,u['id'],update_resolution,tid))
+        if new_status == 'Resolved':
+            c.execute('UPDATE tickets SET status=?,updated_at=?,resolved_at=?,resolved_by=?,doctor_resolution=?,closed_at=?,resolution_requested_at=NULL WHERE id=?',(new_status,timestamp,timestamp,u['id'],update_resolution or 'yes',timestamp,tid))
+            c.execute("UPDATE conversations SET status='closed',closed_at=?,updated_at=? WHERE id=?",(timestamp,timestamp,existing['conversation_id']))
         elif u['role'] == 'doctor' and update_resolution == 'no':
             c.execute('UPDATE tickets SET status=?,updated_at=?,resolved_at=NULL,resolved_by=NULL,doctor_resolution=?,resolution_requested_at=NULL WHERE id=?',(new_status,timestamp,update_resolution,tid))
         else:
@@ -3730,14 +3776,11 @@ def update_ticket(tid:int,x:TicketUpdate,authorization: str|None=Header(default=
         for recipient_id in recipients:
             if recipient_id and recipient_id != u['id']:
                 c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)',(recipient_id,notice_title,notice_body,'human_ticket',timestamp))
-        if u['role'] == 'doctor' and update_resolution == 'yes':
-            company_id = resolve_conversation_company(conv_row)
-            company = c.execute("SELECT COALESCE(NULLIF(company,''),name) name FROM users WHERE role='pharma' AND (id=? OR company_user_id=?) ORDER BY id LIMIT 1",(company_id,company_id)).fetchone()
-            company_name = company['name'] if company else 'the pharmaceutical company'
-            c.execute(
-                'INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)',
-                (u['id'], 'Support request resolved', f'Your request with {company_name} has been resolved.', 'human_ticket', timestamp),
-            )
+        if new_status == 'Resolved':
+            resolved_body = f'{u["name"]} resolved the support request. The conversation is now closed.'
+            for recipient_id in _human_participant_ids(c, conv_row):
+                if recipient_id and recipient_id != u['id']:
+                    c.execute('INSERT INTO notifications(user_id,title,body,type,created_at) VALUES(?,?,?,?,?)',(recipient_id,'Support request resolved',resolved_body,'human_ticket',timestamp))
     else:
         if u['role'] not in ('pharma','admin'):
             c.close(); raise HTTPException(403,'Permission denied')

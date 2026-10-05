@@ -43,6 +43,16 @@ def setup_temp_db():
     return temp_db.name
 
 
+def test_sqlite_database_url_uses_local_sqlite_database(tmp_path, monkeypatch):
+    db_path = tmp_path / 'pharmaai-local.db'
+    monkeypatch.setattr(main, 'DATABASE_URL', f'sqlite:///{db_path}')
+    conn = main.db()
+    try:
+        assert conn.execute('SELECT 1').fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
 def create_pharma_user(db_path):
     with sqlite3.connect(db_path) as conn:
         conn.execute(

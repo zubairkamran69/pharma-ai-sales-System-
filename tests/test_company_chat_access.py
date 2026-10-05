@@ -296,16 +296,8 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
                 json={'status': 'RESOLVED'},
             )
             assert resolved.status_code == 200, resolved.text
-            assert resolved.json()['ticket']['status'] == 'Pending Confirmation'
-            confirmation = client.patch(
-                f'/api/tickets/{ticket["id"]}',
-                headers={'Authorization': f'Bearer {doctor_token}'},
-                json={'resolution_confirmation': 'yes'},
-            )
-            assert confirmation.status_code == 200, confirmation.text
-            assert confirmation.json()['ticket']['status'] == 'Resolved'
-            assert confirmation.json()['ticket']['doctor_resolution'] == 'yes'
-            assert confirmation.json()['ticket']['resolved_by'] == 1
+            assert resolved.json()['ticket']['status'] == 'Resolved'
+            assert resolved.json()['ticket']['resolved_by'] == 6
             assert client.get('/api/tickets', headers={'Authorization': f'Bearer {doctor_token}'}).json()[0]['status'] == 'Resolved'
             assert any(item['title'] == 'Support request resolved' for item in client.get('/api/notifications', headers={'Authorization': f'Bearer {doctor_token}'}).json())
             resolved_message = client.post(
@@ -314,13 +306,11 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
                 json={'content': 'I have another question.'},
             )
             assert resolved_message.status_code == 409
-            reopened = client.patch(
-                f'/api/tickets/{ticket["id"]}',
-                headers={'Authorization': f'Bearer {doctor_token}'},
-                json={'status': 'REOPENED'},
-            )
-            assert reopened.status_code == 200, reopened.text
-            assert client.get('/api/tickets', headers={'Authorization': f'Bearer {company_a_token}'}).json()[0]['status'] == 'Reopened'
+            assert conversation['id'] not in {item['id'] for item in client.get('/api/human-conversations', headers={'Authorization': f'Bearer {doctor_token}'}).json()}
+            new_company_a_chat = client.post('/api/conversations', headers={'Authorization': f'Bearer {doctor_token}'}, json={'company_id': 3})
+            assert new_company_a_chat.status_code == 200, new_company_a_chat.text
+            assert new_company_a_chat.json()['id'] != conversation['id']
+            assert new_company_a_chat.json()['ticket_id'] != ticket['id']
 
             company_b_start = client.post(
                 '/api/conversations',
@@ -340,16 +330,9 @@ def test_human_chat_creates_linked_ticket_and_scopes_status_updates():
                 headers={'Authorization': f'Bearer {rep_b_token}'},
                 json={'status': 'Resolved'},
             )
-            assert company_b_resolution.json()['ticket']['status'] == 'Pending Confirmation'
-            doctor_rejected = client.patch(
-                f'/api/tickets/{company_b_ticket["id"]}',
-                headers={'Authorization': f'Bearer {doctor_token}'},
-                json={'resolution_confirmation': 'no'},
-            )
-            assert doctor_rejected.status_code == 200, doctor_rejected.text
-            assert doctor_rejected.json()['ticket']['status'] == 'Pending'
-            assert doctor_rejected.json()['ticket']['doctor_resolution'] == 'no'
-            assert client.get('/api/notifications', headers={'Authorization': f'Bearer {rep_b_token}'}).json()[0]['title'] == 'Doctor still needs help'
+            assert company_b_resolution.status_code == 200, company_b_resolution.text
+            assert company_b_resolution.json()['ticket']['status'] == 'Resolved'
+            assert conversation['id'] not in {item['id'] for item in client.get('/api/human-conversations', headers={'Authorization': f'Bearer {doctor_token}'}).json()}
 
             denied = client.get(
                 f'/api/human-conversations/{conversation["id"]}',
